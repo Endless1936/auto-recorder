@@ -169,7 +169,7 @@ struct AutoZoomPlan: Sendable {
             let scale = active ? 1.6 : 1.0
             if active, let pointer {
                 let margin = 0.5 / scale
-                let deadZone = margin * 0.7
+                let deadZone = margin * 0.5
                 if click { targetX = pointer.x; targetY = pointer.y }
                 else {
                     if abs(pointer.x - targetX) > deadZone { targetX = pointer.x - copysign(deadZone, pointer.x - targetX) }

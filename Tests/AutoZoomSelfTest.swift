@@ -76,7 +76,7 @@ enum AutoZoomSelfTest {
         try check(try JSONDecoder().decode(CursorTrace.self, from: saved).samples.count == trace.samples.count,
                   "轨迹保存错误")
         print("PASS zoom plan: offset coordinates, host time alignment, clicks, 1-second idle/outside restore, bounded crop, no-click, slow movement, jitter, reentry, 30/60fps, JSON")
-        print("PASS 70% safe zone: interior and exact-edge hold, smooth threshold crossing, both axes/directions, in-zone clicks, bounded crop and unchanged idle timing at 30/60fps")
+        print("PASS 50% safe zone: interior and exact-edge hold, smooth threshold crossing, both axes/directions, in-zone clicks, bounded crop and unchanged idle timing at 30/60fps")
     }
 
     private static func checkRecordedMotion() throws {
@@ -357,10 +357,10 @@ enum AutoZoomSelfTest {
     }
 
     private static func checkSafeZone(fps: Int) throws {
-        // Keep the release follower and use the approved centered 70% safe region.
-        let halfSafeZone = 0.21875
-        let insideOffset = 0.1875
-        let outsideOffset = 0.25
+        // Keep the release follower and use the approved centered 50% safe region.
+        let halfSafeZone = 0.15625
+        let insideOffset = 0.125
+        let outsideOffset = 0.1875
         let panDistance = outsideOffset - halfSafeZone
         let alpha = 1 - exp(-1 / Double(fps) / 0.14)
         for horizontal in [true, false] {
@@ -383,7 +383,7 @@ enum AutoZoomSelfTest {
                 let plan = AutoZoomPlan(trace: CursorTrace(samples: samples), duration: 4.5, fps: fps)
                 let held = plan.pose(at: 0.95)
                 try check(abs(held.x - 0.5) < 0.000000001 && abs(held.y - 0.5) < 0.000000001,
-                          "\(label)：70%安全区内或边界意外平移")
+                          "\(label)：50%安全区内或边界意外平移")
                 var expected = 0.5
                 for index in plan.poses.indices {
                     let target = index >= fps && index < 2 * fps ? firstTarget : 0.5
@@ -392,7 +392,7 @@ enum AutoZoomSelfTest {
                     let actual = horizontal ? pose.x : pose.y
                     let otherAxis = horizontal ? pose.y : pose.x
                     try check(index > fps * 3 || (abs(actual - expected) < 0.000000001 && abs(otherAxis - 0.5) < 0.000000001),
-                              "\(label)：越过70%安全区后的平移、反向安全区或原有平滑速度不正确")
+                              "\(label)：越过50%安全区后的平移、反向安全区或原有平滑速度不正确")
                 }
                 let firstPan = plan.poses[fps]
                 let firstCoordinate = horizontal ? firstPan.x : firstPan.y
@@ -440,7 +440,7 @@ enum AutoZoomSelfTest {
             let insideX = viewport.minX >= -0.000000001 && viewport.maxX <= 1.000000001
             let insideY = viewport.minY >= -0.000000001 && viewport.maxY <= 1.000000001
             try check(insideX && insideY && pose.scale >= 1 && pose.scale <= 1.600000001,
-                      "\(label)：70%安全区跟随越出录制范围或改变了放大倍率")
+                      "\(label)：50%安全区跟随越出录制范围或改变了放大倍率")
         }
     }
 
