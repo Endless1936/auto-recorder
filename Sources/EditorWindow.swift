@@ -21,14 +21,15 @@ final class EditorWindow: NSWindow, NSWindowDelegate {
         appearance = NSAppearance(named: .darkAqua)
         backgroundColor = NSColor(AppTheme.background)
         isReleasedWhenClosed = false
-        minSize = NSSize(width: 980, height: 730)
         collectionBehavior = [.fullScreenPrimary]
         let content = EditorContent(model: model, onBack: { [weak self] in self?.returnToRecorder() },
                                     onOpen: onOpen, onExport: onExport,
                                     onFullScreen: { [weak self] in self?.toggleFullScreen(nil) })
-        let hosting = NSHostingView(rootView: content.preferredColorScheme(.dark).ignoresSafeArea())
-        hosting.sizingOptions = []
+        let hosting = NSHostingView(rootView: content.preferredColorScheme(.dark)
+            .frame(minWidth: 980, minHeight: 730).ignoresSafeArea())
+        hosting.sizingOptions = [.minSize]
         contentView = hosting
+        minSize = NSSize(width: 980, height: 730)
         hideSystemTitlebarControls()
         delegate = self
         center()
@@ -815,6 +816,30 @@ private struct TimelinePlayheadTip: Shape {
     }
 }
 
+struct EditorTimeAxisGeometry {
+    static let leadingInset: CGFloat = 38
+    static let toolColumnWidth: CGFloat = 32
+    static let toolSpacing: CGFloat = 4
+    static let trailingInset: CGFloat = toolColumnWidth + toolSpacing + 8
+
+    let containerWidth: CGFloat
+    var minX: CGFloat { Self.leadingInset }
+    var maxX: CGFloat { max(minX + 1, containerWidth - Self.trailingInset) }
+    var width: CGFloat { maxX - minX }
+
+    func x(at time: Double, total: Double) -> CGFloat {
+        minX + CGFloat(time / max(0.001, total)) * width
+    }
+
+    func time(at x: CGFloat, total: Double) -> Double {
+        min(max(0, total), max(0, Double((x - minX) / width) * max(0, total)))
+    }
+
+    func timeDelta(for translation: CGFloat, total: Double) -> Double {
+        Double(translation / width) * max(0, total)
+    }
+}
+
 private struct ProductionTimeline: View {
     @ObservedObject var model: EditorModel
     @GestureState private var reorderState: TimelineReorderState?
@@ -824,29 +849,26 @@ private struct ProductionTimeline: View {
 
     var body: some View {
         GeometryReader { geo in
-            let width = max(1, geo.size.width - 20)
+            let axis = EditorTimeAxisGeometry(containerWidth: geo.size.width)
             let total = max(0.001, model.totalDuration)
-            let usable = max(1, width - CGFloat(max(0, model.clips.count - 1)) * 3)
-            let layouts = clipLayouts(usable: usable, total: total)
-            VStack(spacing: 6) {
-                ruler(width: width, total: total)
-                HStack(spacing: 3) {
-                    ForEach(layouts) { layout in
-                        clipCell(layout.clip, width: layout.frame.width, pixelsPerSecond: usable / total,
-                                 layouts: layouts, size: geo.size)
-                    }
-                }.frame(height: 57)
+            let layouts = clipLayouts(axis: axis, total: total)
+            ruler(axis: axis, total: total)
+                .frame(width: axis.width, height: 25)
+                .position(x: (axis.minX + axis.maxX) / 2, y: 12.5)
+            ForEach(layouts) { layout in
+                clipCell(layout.clip, width: layout.frame.width, axis: axis, total: total,
+                         layouts: layouts, size: geo.size)
+                    .position(x: layout.frame.midX, y: layout.frame.midY)
             }
-            .padding(.horizontal, 10)
             Rectangle().fill(AppTheme.accent).frame(width: 1.5, height: 64)
-                .position(x: 10 + width * model.playhead / total, y: 56)
+                .position(x: axis.x(at: model.playhead, total: total), y: 56)
                 .allowsHitTesting(false)
             TimelinePlayheadTip().fill(AppTheme.accent)
                 .frame(width: 10, height: 20)
                 .frame(width: 32, height: 38, alignment: .top)
                 .contentShape(Rectangle())
-                .position(x: 10 + width * model.playhead / total, y: 23)
-                .highPriorityGesture(scrubGesture(width: width, total: total))
+                .position(x: axis.x(at: model.playhead, total: total), y: 23)
+                .highPriorityGesture(scrubGesture(axis: axis, total: total))
                 .help("拖动播放头浏览视频")
                 .accessibilityLabel("播放头")
                 .accessibilityIdentifier("editor.timeline.playhead")
@@ -879,8 +901,9 @@ private struct ProductionTimeline: View {
         .accessibilityIdentifier("editor.timeline")
     }
 
-    private func ruler(width: CGFloat, total: Double) -> some View {
-        ZStack(alignment: .topLeading) {
+    private func ruler(axis: EditorTimeAxisGeometry, total: Double) -> some View {
+        let width = axis.width
+        return ZStack(alignment: .topLeading) {
             ForEach(0..<9) { index in
                 let time = total * Double(index) / 8
                 Text(total < 10 ? EditorModel.timeLabel(time) : appTime(time))
@@ -900,26 +923,27 @@ private struct ProductionTimeline: View {
         }
         .frame(height: 25)
         .contentShape(Rectangle())
-        .highPriorityGesture(scrubGesture(width: width, total: total))
+        .highPriorityGesture(scrubGesture(axis: axis, total: total))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("剪辑时间刻度")
         .accessibilityIdentifier("editor.timeline.ruler")
     }
 
-    private func scrubGesture(width: CGFloat, total: Double) -> some Gesture {
+    private func scrubGesture(axis: EditorTimeAxisGeometry, total: Double) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .named("productionTimeline")).onChanged { value in
             model.isPlaying = false
             model.player.pause()
-            model.seek(max(0, min(total, Double((value.location.x - 10) / width) * total)))
+            model.seek(axis.time(at: value.location.x, total: total))
         }
     }
 
-    private func clipLayouts(usable: CGFloat, total: Double) -> [TimelineClipLayout] {
-        var x: CGFloat = 10
+    private func clipLayouts(axis: EditorTimeAxisGeometry, total: Double) -> [TimelineClipLayout] {
+        var offset = 0.0
         return model.clips.map { clip in
-            let width = max(2, usable * clip.duration / total)
-            defer { x += width + 3 }
-            return TimelineClipLayout(clip: clip, frame: CGRect(x: x, y: 31, width: width, height: 57))
+            let start = axis.x(at: offset, total: total)
+            let end = axis.x(at: offset + clip.duration, total: total)
+            defer { offset += clip.duration }
+            return TimelineClipLayout(clip: clip, frame: CGRect(x: start, y: 31, width: max(0, end - start), height: 57))
         }
     }
 
@@ -960,17 +984,18 @@ private struct ProductionTimeline: View {
             }
     }
 
-    private func clipCell(_ clip: DemoClip, width: CGFloat, pixelsPerSecond: CGFloat,
+    private func clipCell(_ clip: DemoClip, width: CGFloat, axis: EditorTimeAxisGeometry, total: Double,
                           layouts: [TimelineClipLayout], size: CGSize) -> some View {
         let selected = model.editingSelectionTarget == .clip && model.selectedClipID == clip.id
         return ZStack {
             ClipFrameStrip(source: model.sourceURL, start: clip.sourceStart, duration: clip.duration)
             if !selected { Color.black.opacity(0.22) }
         }
-        .frame(width: width, height: 57)
+        .frame(width: max(0, width - 3), height: 57)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6)
             .strokeBorder(selected ? AppTheme.accent : AppTheme.line, lineWidth: selected ? 2 : 1))
+        .frame(width: width, height: 57)
         .contentShape(Rectangle())
         .onTapGesture {
             model.isPlaying = false
@@ -979,8 +1004,8 @@ private struct ProductionTimeline: View {
         }
         .gesture(reorderGesture(for: clip.id, layouts: layouts, size: size))
         .opacity(reorderState?.clipID == clip.id ? 0.45 : 1)
-        .overlay(alignment: .leading) { if selected { trimHandle(clip, edge: 0, width: width, pixelsPerSecond: pixelsPerSecond) } }
-        .overlay(alignment: .trailing) { if selected { trimHandle(clip, edge: 1, width: width, pixelsPerSecond: pixelsPerSecond) } }
+        .overlay(alignment: .leading) { if selected { trimHandle(clip, edge: 0, width: width, axis: axis, total: total) } }
+        .overlay(alignment: .trailing) { if selected { trimHandle(clip, edge: 1, width: width, axis: axis, total: total) } }
         .help("点击选择；拖动调整顺序；拖动两端裁剪")
         .accessibilityElement(children: .contain)
         .accessibilityLabel("视频片段，\(appTime(clip.duration))")
@@ -994,7 +1019,7 @@ private struct ProductionTimeline: View {
         }
     }
 
-    private func trimHandle(_ clip: DemoClip, edge: Int, width: CGFloat, pixelsPerSecond: CGFloat) -> some View {
+    private func trimHandle(_ clip: DemoClip, edge: Int, width: CGFloat, axis: EditorTimeAxisGeometry, total: Double) -> some View {
         HStack(spacing: 2) {
             Capsule().fill(AppTheme.background).frame(width: 1.5, height: 14)
             Capsule().fill(AppTheme.background).frame(width: 1.5, height: 14)
@@ -1008,7 +1033,7 @@ private struct ProductionTimeline: View {
             trimEdge = edge
             trimDelta = edge == 0 ? max(0, min(width - 10, value.translation.width)) : min(0, max(-width + 10, value.translation.width))
         }.onEnded { _ in
-            let change = Double(trimDelta / max(0.01, pixelsPerSecond))
+            let change = axis.timeDelta(for: trimDelta, total: total)
             model.select(clip.id)
             if edge == 0 { model.trimSelected(start: change, end: clip.duration) }
             else { model.trimSelected(start: 0, end: clip.duration + change) }
@@ -1095,44 +1120,47 @@ private struct ProductionZoomGraph: View {
     private var selectedCameraIDs: Set<UUID> { model.selectedCameraAnchorIDs }
 
     var body: some View {
-        HStack(spacing: 8) {
-            GeometryReader { geo in
+        GeometryReader { geo in
+            ZStack(alignment: .trailing) {
                 graph(size: geo.size)
+                VStack(spacing: 3) {
+                    EditorIcon(symbol: "viewfinder", help: "显示取景框与路径（暂停后可拖动）",
+                               selected: model.showsFramingOverlay, controlHeight: 26, action: model.toggleFramingOverlay)
+                        .accessibilityIdentifier("editor.framing.toggle")
+                        .accessibilityValue(model.showsFramingOverlay ? "已开启" : "已关闭")
+                        .disabled(model.clips.isEmpty)
+                    EditorIcon(symbol: "plus.diamond", help: "在当前时刻添加取景锚点", controlHeight: 26) { model.addFramingAnchor() }
+                        .accessibilityIdentifier("editor.framing.addAnchor")
+                        .disabled(!model.canAddFramingAnchor)
+                    EditorIcon(symbol: "plus", help: "在播放头添加放大", controlHeight: 26) { model.addZoom() }
+                        .accessibilityIdentifier("editor.zoom.add")
+                    EditorIcon(symbol: "minus", help: "移除所选放大段（可撤销）", controlHeight: 26) { model.resetZoom() }
+                        .accessibilityIdentifier("editor.zoom.reset")
+                        .disabled(model.selectedZoom == nil)
+                }.frame(width: EditorTimeAxisGeometry.toolColumnWidth)
             }
-            VStack(spacing: 3) {
-                EditorIcon(symbol: "viewfinder", help: "显示取景框与路径（暂停后可拖动）",
-                           selected: model.showsFramingOverlay, controlHeight: 26, action: model.toggleFramingOverlay)
-                    .accessibilityIdentifier("editor.framing.toggle")
-                    .accessibilityValue(model.showsFramingOverlay ? "已开启" : "已关闭")
-                    .disabled(model.clips.isEmpty)
-                EditorIcon(symbol: "plus.diamond", help: "在当前时刻添加取景锚点", controlHeight: 26) { model.addFramingAnchor() }
-                    .accessibilityIdentifier("editor.framing.addAnchor")
-                    .disabled(!model.canAddFramingAnchor)
-                EditorIcon(symbol: "plus", help: "在播放头添加放大", controlHeight: 26) { model.addZoom() }
-                    .accessibilityIdentifier("editor.zoom.add")
-                EditorIcon(symbol: "minus", help: "移除所选放大段（可撤销）", controlHeight: 26) { model.resetZoom() }
-                    .accessibilityIdentifier("editor.zoom.reset")
-                    .disabled(model.selectedZoom == nil)
-            }.frame(width: 36)
         }
     }
 
     private func graph(size: CGSize) -> some View {
-        let left: CGFloat = 43
-        let right: CGFloat = 15
+        let axis = EditorTimeAxisGeometry(containerWidth: size.width)
+        let left = axis.minX
         let top: CGFloat = 16
         let bottom: CGFloat = 18
-        let width = max(1, size.width - left - right)
+        let width = axis.width
         let height = max(1, size.height - top - bottom)
         let total = max(0.001, model.totalDuration)
         let range = max(0.1, maximum - 1)
         let point: (Double, Double) -> CGPoint = { time, scale in
-            CGPoint(x: left + CGFloat(time / total) * width, y: top + CGFloat((maximum - scale) / range) * height)
+            CGPoint(x: axis.x(at: time, total: total), y: top + CGFloat((maximum - scale) / range) * height)
         }
         return ZStack(alignment: .topLeading) {
             RoundedRectangle(cornerRadius: 12).fill(AppTheme.paper)
                 .padding(.leading, left - 10)
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(AppTheme.line).padding(.leading, left - 10))
+                .padding(.trailing, EditorTimeAxisGeometry.toolColumnWidth + EditorTimeAxisGeometry.toolSpacing)
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(AppTheme.line)
+                    .padding(.leading, left - 10)
+                    .padding(.trailing, EditorTimeAxisGeometry.toolColumnWidth + EditorTimeAxisGeometry.toolSpacing))
             axisLabel("1.0×", at: CGPoint(x: 17, y: point(0, 1).y))
             axisLabel("2.0×", at: CGPoint(x: 17, y: point(0, 2).y))
             axisLabel("3.0×", at: CGPoint(x: 17, y: point(0, 3).y))
@@ -1154,7 +1182,7 @@ private struct ProductionZoomGraph: View {
                 if isSelected(item) {
                     ForEach(item.zoom.cameraControlPoints) { control in
                         if control.time >= 0 && control.time <= item.clip.duration {
-                            cameraNode(control, item: item, width: width, height: height,
+                            cameraNode(control, item: item, axis: axis, height: height,
                                        total: total, range: range, point: point)
                         }
                     }
@@ -1184,6 +1212,7 @@ private struct ProductionZoomGraph: View {
             if hasOverlappingZooms {
                 Text("重叠放大").font(.system(size: 11)).foregroundStyle(AppTheme.secondary)
                     .padding(.horizontal, 10).padding(.top, 5)
+                    .padding(.trailing, EditorTimeAxisGeometry.toolColumnWidth + EditorTimeAxisGeometry.toolSpacing)
             }
         }
         .coordinateSpace(name: "productionZoom")
@@ -1213,7 +1242,7 @@ private struct ProductionZoomGraph: View {
             defer { marqueeRect = nil; marqueeStart = nil; marqueeSeed = [] }
             guard marqueeRect == nil, nodeDrag == nil else { return }
             model.clearCameraAnchorSelection()
-            let time = min(total, max(0, Double((value.location.x - left) / width) * total))
+            let time = axis.time(at: value.location.x, total: total)
             if let item = locations.first(where: { time >= $0.offset + max(0, $0.zoom.start) && time <= $0.offset + min($0.clip.duration, $0.zoom.end) }) {
                 model.selectZoom(item.zoom.id)
             }
@@ -1232,7 +1261,7 @@ private struct ProductionZoomGraph: View {
     }
 
     private func cameraNode(_ control: CameraKeyframe, item: CurveLocation,
-                            width: CGFloat, height: CGFloat,
+                            axis: EditorTimeAxisGeometry, height: CGFloat,
                             total: Double, range: Double, point: @escaping (Double, Double) -> CGPoint) -> some View {
         let selected = model.editingSelectionTarget == .cameraAnchors && model.selectedClipID == item.clip.id &&
             model.selectedZoomID == item.zoom.id && selectedCameraIDs.contains(control.id)
@@ -1269,7 +1298,7 @@ private struct ProductionZoomGraph: View {
                     model.isPlaying = false
                     let tolerance = NSApp.currentEvent?.modifierFlags.contains(.option) == true ? 0 : 6 * range / Double(height)
                     snapGuideScale = model.dragCameraAnchors(from: drag.base, ids: drag.ids,
-                        timeDelta: Double(value.translation.width / width) * total,
+                        timeDelta: axis.timeDelta(for: value.translation.width, total: total),
                         scaleDelta: -Double(value.translation.height / height) * range, snapTolerance: tolerance)
                 }.onEnded { _ in
                     if nodeDrag?.isEditing == true { model.endEditing() }

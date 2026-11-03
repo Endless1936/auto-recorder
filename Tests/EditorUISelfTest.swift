@@ -112,7 +112,8 @@ enum EditorUISelfTest {
             try await seekUsingRuler(fraction: 0.28)
             let timeline = try frame("editor.timeline")
             let marker = try frame("editor.timeline.playhead")
-            let targetX = timeline.minX + 10 + (timeline.width - 20) * 0.72
+            let timelineAxis = EditorTimeAxisGeometry(containerWidth: timeline.width)
+            let targetX = timeline.minX + timelineAxis.x(at: model.totalDuration * 0.72, total: model.totalDuration)
             // x + 13 and the bottom five points are outside the visible triangle.
             let markerGrab = NSPoint(x: marker.midX + 13, y: marker.minY + 5)
             try await drag(from: markerGrab, to: NSPoint(x: targetX, y: markerGrab.y))
@@ -144,10 +145,118 @@ enum EditorUISelfTest {
                 record("trim-\(edge)-and-single-undo", began, "The native handle shortened the clip without reordering; one Command-Z restored content.")
             }
 
+            try await checkTimeAxisAlignment(original: original)
             try await checkPreviewControls(original: original)
             try require(model.clips == original, "The native UI test left content edits behind.")
             try screenshot("final")
             try requireNoRuntimeErrors()
+        }
+
+        func checkTimeAxisAlignment(original: [DemoClip]) async throws {
+            guard original.count >= 2, original[0].duration > 0.3, original[1].duration > 0.3 else {
+                throw failure("Time-axis alignment requires two nonempty source clips.")
+            }
+            let previousFrame = window.frame
+            let previousClipID = model.selectedClipID, previousZoomID = model.selectedZoomID
+            let previousTime = model.playhead
+            defer { window.setFrame(previousFrame, display: true) }
+            var fixture = original
+            for index in fixture.indices { fixture[index].zooms = [] }
+            func zoom(duration: Double) -> ZoomSegment {
+                let points = [CameraKeyframe(time: duration * 0.08, scale: 1),
+                    CameraKeyframe(time: duration * 0.3, scale: 1.7),
+                    CameraKeyframe(time: duration * 0.7, scale: 2),
+                    CameraKeyframe(time: duration * 0.92, scale: 1)]
+                return ZoomSegment(start: points[0].time, riseEnd: points[1].time,
+                    fallStart: points[2].time, end: points[3].time, peak: 2,
+                    manualFocus: true, cameraKeyframes: points).normalized()
+            }
+            let firstZoom = zoom(duration: fixture[0].duration), secondZoom = zoom(duration: fixture[1].duration)
+            fixture[0].zooms = [firstZoom]; fixture[1].zooms = [secondZoom]
+            model.clips = fixture
+            model.selectedClipID = fixture[0].id; model.selectedZoomID = firstZoom.id
+            model.seek(0)
+            try model.autosave()
+            try await model.rebuildPreview()
+            let total = model.totalDuration
+            let display = window.screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+            let minimum = window.minSize
+            try require(minimum.width >= 980 && minimum.height >= 730,
+                        "The editor lost its supported minimum window size after installing its content view: \(minimum).")
+            let large = NSSize(width: min(display.width - 24, max(previousFrame.width + 200, 1400)),
+                               height: min(display.height - 24, max(previousFrame.height + 60, 940)))
+            let cases: [(String, NSSize)] = [("normal", previousFrame.size), ("minimum", minimum), ("large", large)]
+            for (name, size) in cases {
+                let began = Date()
+                let rect = NSRect(x: display.midX - size.width / 2, y: display.midY - size.height / 2,
+                                  width: size.width, height: size.height)
+                window.setFrame(rect, display: true)
+                await settle(0.12)
+                await refreshDisplayedLayout()
+                let ruler = try frame("editor.timeline.ruler")
+                let graph = try frame("editor.zoomGraph")
+                let axis = EditorTimeAxisGeometry(containerWidth: graph.width)
+                try require(abs(ruler.minX - graph.minX - axis.minX) <= 1 &&
+                            abs(ruler.maxX - graph.minX - axis.maxX) <= 1,
+                            "The ruler and curve plot have different visible time ranges after a \(name) resize.")
+                let timeTolerance = max(0.002, total * 1.1 / Double(max(1, ruler.width)))
+                for fraction in [0.15, 0.5, 0.85] {
+                    let time = total * fraction
+                    let x = ruler.minX + ruler.width * fraction
+                    try await click(at: NSPoint(x: x, y: ruler.midY), delay: 0.06)
+                    try require(abs(model.playhead - time) <= timeTolerance &&
+                                abs((try frame("editor.timeline.playhead")).midX - x) <= 1,
+                                "Ruler click and playhead disagree at \(fraction) after a \(name) resize.")
+                    // Take x from the independent, displayed ruler, not from the
+                    // curve's mapping helper; native hit-testing must agree.
+                    let curveY = try cameraGraphPoint(globalTime: time, scale: 2.85).y
+                    try await click(at: NSPoint(x: x, y: curveY), delay: 0.06)
+                    try require(abs(model.playhead - time) <= timeTolerance &&
+                                abs((try frame("editor.timeline.playhead")).midX - x) <= 1 && model.clips == fixture,
+                                "A curve click at the ruler's physical x seeks a different time after a \(name) resize.")
+                }
+                for (index, zoom) in [(0, firstZoom), (1, secondZoom)] {
+                    model.selectedClipID = fixture[index].id; model.selectedZoomID = zoom.id
+                    await refreshDisplayedLayout()
+                    let control = zoom.cameraControlPoints[1]
+                    let time = model.startTime(of: fixture[index].id) + control.time
+                    let node = center(try frame("editor.zoom.\(zoom.id.uuidString).anchor.\(control.id.uuidString)"))
+                    let expectedX = ruler.minX + ruler.width * CGFloat(time / total)
+                    try require(abs(node.x - expectedX) <= 1,
+                                "A curve node does not align with its global ruler time after a \(name) resize.")
+                    try await click(at: node, delay: 0.06)
+                    try require(abs(model.playhead - time) <= timeTolerance &&
+                                abs((try frame("editor.timeline.playhead")).midX - node.x) <= 1 &&
+                                model.selectedCameraAnchorIDs == [control.id],
+                                "Curve node, playhead and selected global time disagree after a \(name) resize.")
+                }
+                let moving = secondZoom.cameraControlPoints[1]
+                let identifier = "editor.zoom.\(secondZoom.id.uuidString).anchor.\(moving.id.uuidString)"
+                let start = center(try frame(identifier))
+                let targetTime = model.startTime(of: fixture[1].id) + fixture[1].duration * 0.44
+                let targetX = ruler.minX + ruler.width * CGFloat(targetTime / total)
+                try await drag(from: start, to: NSPoint(x: targetX, y: start.y))
+                guard let moved = model.selectedZoom?.cameraControlPoints.first(where: { $0.id == moving.id }) else {
+                    throw failure("Time-axis node drag lost its selected control.")
+                }
+                let movedTime = model.startTime(of: fixture[1].id) + moved.time
+                try require(abs(movedTime - targetTime) <= timeTolerance && abs(model.playhead - targetTime) <= timeTolerance &&
+                            abs((try frame(identifier)).midX - targetX) <= 1 &&
+                            abs((try frame("editor.timeline.playhead")).midX - targetX) <= 1,
+                            "Horizontal curve drag uses a different time scale from the ruler/playhead after a \(name) resize.")
+                try await undo()
+                try require(model.clips == fixture, "One Undo did not restore the axis-alignment node drag.")
+                try screenshot("time-axis-\(name)")
+                record("shared-time-axis-\(name)", began,
+                       "Ruler-based native clicks, two clips' actual curve nodes and a horizontal node drag agreed with the playhead within one point at window size \(window.frame.size).")
+            }
+            window.setFrame(previousFrame, display: true)
+            model.clips = original; model.selectedClipID = previousClipID; model.selectedZoomID = previousZoomID
+            model.seek(previousTime)
+            try model.autosave()
+            try await model.rebuildPreview()
+            await refreshDisplayedLayout()
+            try require(model.clips == original, "Time-axis alignment fixtures left edits behind.")
         }
 
         func checkPreviewControls(original: [DemoClip]) async throws {
@@ -773,16 +882,11 @@ enum EditorUISelfTest {
         }
 
         func cameraGraphPoint(globalTime: Double, scale: Double) throws -> NSPoint {
-            guard let view = window.contentView else { throw failure("Camera graph has no content view.") }
-            let size = view.bounds.size
-            let graphTop = 76 + max(220, size.height - 330) + 16 + 88 + 14
-            let graphWidth = size.width - 48 - 44
+            let graph = try frame("editor.zoomGraph")
+            let axis = EditorTimeAxisGeometry(containerWidth: graph.width)
             let maximum = 3.05
-            let position = NSPoint(x: 24 + 43 + CGFloat(globalTime / max(0.001, model.totalDuration)) * (graphWidth - 43 - 15),
-                                   y: graphTop + 16 + CGFloat((maximum - scale) / max(0.1, maximum - 1)) * (116 - 16 - 18))
-            let local = NSPoint(x: view.bounds.minX + position.x,
-                                y: view.isFlipped ? view.bounds.minY + position.y : view.bounds.maxY - position.y)
-            return view.convert(local, to: nil)
+            return NSPoint(x: graph.minX + axis.x(at: globalTime, total: model.totalDuration),
+                           y: graph.maxY - 16 - CGFloat((maximum - scale) / max(0.1, maximum - 1)) * max(1, graph.height - 16 - 18))
         }
 
         func checkCameraCurveSelection(original: [DemoClip]) async throws {
@@ -1583,8 +1687,14 @@ enum EditorUISelfTest {
         /// launch. This fallback only locates pixels; the same native events and
         /// observed-state assertions still have to succeed.
         func layoutFrame(_ identifier: String) throws -> NSRect {
-            guard let view = window.contentView, view.bounds.width >= 980, view.bounds.height >= 730 else {
-                throw failure("Editor layout geometry is unavailable or below its supported minimum size.")
+            guard let view = window.contentView else {
+                throw failure("Editor has no content view (frame=\(window.frame), minSize=\(window.minSize)).")
+            }
+            guard view.bounds.width.isFinite, view.bounds.height.isFinite,
+                  view.bounds.width > 0, view.bounds.height > 0,
+                  window.frame.width + 0.5 >= window.minSize.width,
+                  window.frame.height + 0.5 >= window.minSize.height else {
+                throw failure("Editor layout geometry is invalid or below its window minimum (bounds=\(view.bounds), frame=\(window.frame), minSize=\(window.minSize)).")
             }
             if identifier.hasPrefix("editor.framing."), identifier != "editor.framing.toggle", identifier != "editor.framing.addAnchor" {
                 guard let state = model.framingState else { throw failure("Framing geometry is unavailable: \(identifier).") }
@@ -1618,17 +1728,20 @@ enum EditorUISelfTest {
             let previewHeight = max(220, size.height - 330)
             let timelineTop = 76 + previewHeight + 16
             let timelineWidth = size.width - 48
-            let rulerWidth = timelineWidth - 20
+            let axis = EditorTimeAxisGeometry(containerWidth: timelineWidth)
+            let rulerWidth = axis.width
             let total = max(0.001, model.totalDuration)
             var topRect: NSRect?
             switch identifier {
             case "editor.timeline":
                 topRect = NSRect(x: 24, y: timelineTop, width: timelineWidth, height: 88)
             case "editor.timeline.ruler":
-                topRect = NSRect(x: 34, y: timelineTop, width: rulerWidth, height: 25)
+                topRect = NSRect(x: 24 + axis.minX, y: timelineTop, width: rulerWidth, height: 25)
             case "editor.timeline.playhead":
-                let x = 34 + rulerWidth * model.playhead / total
+                let x = 24 + axis.x(at: model.playhead, total: total)
                 topRect = NSRect(x: x - 16, y: timelineTop + 4, width: 32, height: 38)
+            case "editor.zoomGraph":
+                topRect = NSRect(x: 24, y: timelineTop + 88 + 14, width: timelineWidth, height: 116)
             case "editor.preview.surface":
                 topRect = NSRect(x: 24, y: 76, width: timelineWidth, height: previewHeight)
             case "editor.preview.backward", "editor.preview.play", "editor.preview.forward":
@@ -1663,10 +1776,10 @@ enum EditorUISelfTest {
                     let point = try cameraGraphPoint(globalTime: model.startTime(of: clip.id) + anchor.time, scale: anchor.scale)
                     return NSRect(x: point.x - 14, y: point.y - 14, width: 28, height: 28)
                 }
-                let usable = max(1, rulerWidth - CGFloat(max(0, model.clips.count - 1)) * 3)
-                var x: CGFloat = 34
+                var offset = 0.0
                 for clip in model.clips {
-                    let width = max(2, usable * clip.duration / total)
+                    let x = 24 + axis.x(at: offset, total: total)
+                    let width = rulerWidth * clip.duration / total
                     let clipID = "editor.clip.\(clip.id.uuidString)"
                     if identifier == clipID {
                         topRect = NSRect(x: x, y: timelineTop + 31, width: width, height: 57)
@@ -1676,7 +1789,7 @@ enum EditorUISelfTest {
                         topRect = NSRect(x: x + width - 12, y: timelineTop + 31, width: 12, height: 57)
                     }
                     if topRect != nil { break }
-                    x += width + 3
+                    offset += clip.duration
                 }
             }
             guard let topRect else { throw failure("Missing native accessibility target and layout mapping: \(identifier).") }
