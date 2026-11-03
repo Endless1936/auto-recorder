@@ -62,6 +62,9 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     var cameraKeyframes: [CameraKeyframe]?
     var centerOffsets: [CameraCenterOffset]?
     var centerPanSpans: [CameraPanSpan]?
+    // New automatic paths ease viewport size and center together. Older authored
+    // documents retain their original magnification interpolation.
+    var simpleMotion: Bool?
 
     init(id: UUID = UUID(), start: Double = 1, riseEnd: Double = 2,
          fallStart: Double = 8, end: Double = 9, peak: Double = 1.6,
@@ -70,7 +73,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
          manualCenterPath: [ZoomCenterPoint]? = nil,
          cameraKeyframes: [CameraKeyframe]? = nil,
          centerOffsets: [CameraCenterOffset]? = nil,
-         centerPanSpans: [CameraPanSpan]? = nil) {
+         centerPanSpans: [CameraPanSpan]? = nil, simpleMotion: Bool? = nil) {
         self.id = id; self.start = start; self.riseEnd = riseEnd
         self.fallStart = fallStart; self.end = end; self.peak = peak
         self.focusX = focusX; self.focusY = focusY
@@ -79,6 +82,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         self.cameraKeyframes = cameraKeyframes
         self.centerOffsets = centerOffsets
         self.centerPanSpans = centerPanSpans
+        self.simpleMotion = simpleMotion
     }
 
     static func standard(duration: Double, peak: Double = 1.6) -> ZoomSegment {
@@ -407,6 +411,11 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             guard let upper = points.firstIndex(where: { $0.time > time }), upper > 0 else { return 1 }
             let a = points[upper - 1], b = points[upper]
             let span = b.time - a.time, t = (time - a.time) / span
+            if simpleMotion == true {
+                let inverse = CameraMotion.hermite(1 / a.scale, 1 / b.scale,
+                    -(a.slope ?? 0) / (a.scale * a.scale), -(b.slope ?? 0) / (b.scale * b.scale), span, t)
+                return min(3, max(1, 1 / max(1.0 / 3, inverse)))
+            }
             let value = (2*t*t*t - 3*t*t + 1) * a.scale + (t*t*t - 2*t*t + t) * span * (a.slope ?? 0) +
                 (-2*t*t*t + 3*t*t) * b.scale + (t*t*t - t*t) * span * (b.slope ?? 0)
             return min(3, max(1, value))
@@ -426,6 +435,13 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             guard let upper = points.firstIndex(where: { $0.time > time }), upper > 0 else { return 0 }
             let a = points[upper - 1], b = points[upper], span = b.time - a.time
             let t = (time - a.time) / span
+            if simpleMotion == true {
+                let slopeA = -(a.slope ?? 0) / (a.scale * a.scale)
+                let slopeB = -(b.slope ?? 0) / (b.scale * b.scale)
+                let inverse = CameraMotion.hermite(1 / a.scale, 1 / b.scale, slopeA, slopeB, span, t)
+                let derivative = CameraMotion.hermiteDerivative(1 / a.scale, 1 / b.scale, slopeA, slopeB, span, t)
+                return -derivative / (inverse * inverse)
+            }
             return ((6*t*t - 6*t) * a.scale + (-6*t*t + 6*t) * b.scale) / span +
                 (3*t*t - 4*t + 1) * (a.slope ?? 0) + (3*t*t - 2*t) * (b.slope ?? 0)
         }
@@ -600,6 +616,15 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
                 result.peak = points.map(\.scale).max() ?? 1
                 result.riseEnd = result.start + (result.end - result.start) / 3
                 result.fallStart = result.start + (result.end - result.start) * 2 / 3
+                if result.simpleMotion == true {
+                    let middle = Array(points.dropFirst().dropLast())
+                    let high = middle.filter { abs($0.scale - result.peak) < 0.000000001 }
+                    let phasePoints = high.count >= 2 ? high : middle
+                    if let first = phasePoints.first, let last = phasePoints.last, first.time < last.time {
+                        result.riseEnd = first.time
+                        result.fallStart = last.time
+                    }
+                }
             } else { result.cameraKeyframes = nil }
         }
         if let raw = result.centerOffsets {
@@ -850,7 +875,8 @@ enum ProjectStore {
     }
 
     static func automaticZooms(trace: CursorTrace, duration: Double, fps: Int32) -> [ZoomSegment] {
-        guard trace.hasClicks else { return [] }
+        guard duration.isFinite, duration > 0, fps > 0, trace.hasClicks else { return [] }
+        let planningTrace = CursorTrace(samples: trace.samples.filter { $0.time >= 0 && $0.time <= duration })
         let plan = AutoZoomPlan(trace: trace, duration: duration, fps: min(30, Int(fps)))
         let step = 1 / Double(plan.fps)
         let count = min(plan.poses.count, Int(floor(duration * Double(plan.fps))) + 1)
@@ -879,10 +905,29 @@ enum ProjectStore {
             let path = (max(0, first - 1)...min(plan.poses.count - 1, last + 1)).map {
                 ZoomCenterPoint(time: Double($0) * step, x: plan.poses[$0].x, y: plan.poses[$0].y)
             }
-            return ZoomSegment(start: start, riseEnd: Double(rise) * step, fallStart: fallTime,
+            let original = ZoomSegment(start: start, riseEnd: Double(rise) * step, fallStart: fallTime,
                 end: end, peak: peak, focusX: plan.poses[rise].x, focusY: plan.poses[rise].y,
                 centerPath: path).normalized()
+            return simplifiedMotion(original, trace: planningTrace, fps: Int(fps))
         }
+    }
+
+    static func simplifiedMotion(_ original: ZoomSegment, trace: CursorTrace, fps: Int) -> ZoomSegment? {
+        let times = [original.start, original.riseEnd, original.fallStart, original.end]
+        let mandatory = times.map { time -> SimplifiedCameraWaypoint in
+            let pose = original.pose(at: time)
+            return SimplifiedCameraWaypoint(time: time, x: pose.x, y: pose.y, scale: original.scale(at: time))
+        }
+        let points = SimplifiedCameraPath.plan(trace: trace, mandatory: mandatory, fps: fps)
+        guard points.count >= 4, points.contains(where: { $0.scale > 1.000001 }) else { return nil }
+        var result = original
+        result.simpleMotion = true
+        result.manualFocus = true
+        result.manualCenterPath = points.map { ZoomCenterPoint(time: $0.time, x: $0.x, y: $0.y) }
+        result.cameraKeyframes = points.map { CameraKeyframe(time: $0.time, scale: $0.scale) }
+        result.centerOffsets = nil
+        result.centerPanSpans = nil
+        return result.normalized()
     }
 }
 

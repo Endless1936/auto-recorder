@@ -954,7 +954,94 @@ enum EditorUISelfTest {
                            y: graph.maxY - 16 - CGFloat((maximum - scale) / max(0.1, maximum - 1)) * max(1, graph.height - 16 - 18))
         }
 
+        func checkSimplifiedCurveEditing(original: [DemoClip]) async throws {
+            guard let targetIndex = original.firstIndex(where: { $0.duration >= 2 }) else {
+                throw failure("Simplified-camera interactions require a source clip of at least two seconds.")
+            }
+            let began = Date()
+            let previousClipID = model.selectedClipID, previousZoomID = model.selectedZoomID
+            let previousTime = model.playhead
+            let duration = original[targetIndex].duration, clipID = original[targetIndex].id
+            let offset = model.startTime(of: clipID)
+            let points = [CameraKeyframe(time: duration * 0.05, scale: 1),
+                CameraKeyframe(time: duration * 0.25, scale: 1.8),
+                CameraKeyframe(time: duration * 0.72, scale: 1.6),
+                CameraKeyframe(time: duration * 0.95, scale: 1)]
+            let centers = [ZoomCenterPoint(time: points[0].time, x: 0.5, y: 0.5),
+                ZoomCenterPoint(time: points[1].time, x: 0.42, y: 0.45),
+                ZoomCenterPoint(time: points[2].time, x: 0.6, y: 0.55),
+                ZoomCenterPoint(time: points[3].time, x: 0.5, y: 0.5)]
+            let zoom = ZoomSegment(start: points[0].time, riseEnd: points[1].time,
+                fallStart: points[2].time, end: points[3].time, peak: 1.8,
+                centerPath: centers, manualFocus: true, manualCenterPath: centers,
+                cameraKeyframes: points, simpleMotion: true).normalized()
+            var fixture = original
+            fixture[targetIndex].zooms = [zoom]
+            model.clips = fixture
+            model.selectedClipID = clipID; model.selectedZoomID = zoom.id
+            model.seek(offset + duration * 0.5)
+            try model.autosave()
+            try await model.rebuildPreview()
+            try await click("editor.framing.toggle")
+            try await waitUntil("Simplified-camera fixture did not prepare its raw preview.") {
+                self.model.showsFramingOverlay && self.model.isFramingPreviewReady
+            }
+            guard let rawItem = model.player.currentItem else { throw failure("Simplified-camera fixture has no raw video item.") }
+            let anchorTime = model.activeLocalTime
+            try await click("editor.framing.addAnchor")
+            guard let addedZoom = model.selectedZoom,
+                  let addedPoint = addedZoom.cameraControlPoints.first(where: { abs($0.time - anchorTime) < 0.001 }) else {
+                throw failure("Native Add Anchor did not create a point on the simplified camera path.")
+            }
+            let addedClips = model.clips
+            try require(addedZoom.simpleMotion == true && addedZoom.cameraControlPoints.count == 5,
+                        "Adding a simplified-camera anchor lost its inverse-scale interpolation mode.")
+            for index in 0...160 {
+                let time = duration * Double(index) / 160
+                let before = zoom.pose(at: time), after = addedZoom.pose(at: time)
+                try require(abs(before.x - after.x) < 0.00000001 && abs(before.y - after.y) < 0.00000001 &&
+                            abs(before.scale - after.scale) < 0.00000001,
+                            "Adding an unchanged simplified-camera anchor altered the original movement or magnification.")
+            }
+            let identifier = "editor.zoom.\(zoom.id.uuidString).anchor.\(addedPoint.id.uuidString)"
+            let targetTime = anchorTime + duration * 0.08
+            try await drag(from: center(try frame(identifier)),
+                           to: cameraGraphPoint(globalTime: offset + targetTime, scale: 2.35))
+            guard let movedZoom = model.selectedZoom,
+                  let moved = movedZoom.cameraControlPoints.first(where: { $0.id == addedPoint.id }) else {
+                throw failure("Native dragging lost the added simplified-camera anchor.")
+            }
+            let saved = try persistedClips()
+            try require(abs(moved.time - targetTime) < 0.000001 && moved.scale > 2.1 &&
+                        movedZoom.simpleMotion == true && movedZoom.centerPath == zoom.centerPath &&
+                        saved == model.clips && saved[targetIndex].zooms.first(where: { $0.id == zoom.id })?.simpleMotion == true &&
+                        model.player.currentItem === rawItem,
+                        "Dragging a simplified-camera node failed to save time/scale/mode, changed the retained path or replaced raw video.")
+            try screenshot("simplified-camera-native-node-drag")
+            try await undo()
+            try require(model.clips == addedClips && model.player.currentItem === rawItem &&
+                        (try persistedClips()) == addedClips,
+                        "One native Undo did not restore the exact simplified-camera state before dragging.")
+            try await undo()
+            try require(model.clips == fixture && model.player.currentItem === rawItem &&
+                        (try persistedClips()) == fixture,
+                        "The next native Undo did not remove the unchanged simplified-camera insertion.")
+            try await click("editor.framing.toggle")
+            try await waitUntil("Simplified-camera tests did not restore processed preview.") {
+                !self.model.showsFramingOverlay && self.model.previewCameraEffectsEnabled
+            }
+            model.clips = original
+            model.selectedClipID = previousClipID; model.selectedZoomID = previousZoomID
+            model.seek(previousTime)
+            try model.autosave()
+            try await model.rebuildPreview()
+            await refreshDisplayedLayout()
+            record("simplified-motion-native-add-drag-save-and-undo", began,
+                   "Native insertion preserved every sampled inverse-scale pose; dragging its new node saved time, magnification and simpleMotion without replacing raw video, and one Undo restored each exact prior state.")
+        }
+
         func checkCameraCurveSelection(original: [DemoClip]) async throws {
+            try await checkSimplifiedCurveEditing(original: original)
             guard let targetIndex = original.firstIndex(where: { $0.duration >= 2 }) else {
                 throw failure("Curve-selection interactions require a source clip of at least two seconds.")
             }

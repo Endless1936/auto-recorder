@@ -70,11 +70,238 @@ enum AutoZoomSelfTest {
                       "离区重返需点击才能再次放大")
             try checkSafeZone(fps: fps)
         }
+        try checkSimplifiedMotion()
         let saved = try JSONEncoder().encode(trace)
         try check(try JSONDecoder().decode(CursorTrace.self, from: saved).samples.count == trace.samples.count,
                   "轨迹保存错误")
         print("PASS zoom plan: offset coordinates, host time alignment, clicks, 1-second idle/outside restore, bounded crop, no-click, slow movement, jitter, reentry, 30/60fps, JSON")
         print("PASS 70% safe zone: old-band and exact-edge hold, smooth threshold crossing, both axes/directions, in-zone clicks, bounded crop and unchanged idle timing at 30/60fps")
+    }
+
+    private static func checkSimplifiedMotion() throws {
+        struct Scenario {
+            let name: String
+            let trace: CursorTrace
+            let duration: Double
+            let common: Bool
+            let local: Bool
+            let needsPan: Bool
+        }
+        func sampled(_ position: (Double) -> (Double, Double)) -> CursorTrace {
+            CursorTrace(samples: (0...240).map { index in
+                let time = Double(index) / 60, point = position(time)
+                return CursorSample(time: time, x: point.0, y: point.1,
+                    inside: true, clicked: index == 15)
+            })
+        }
+        let circle = sampled { time in
+            let angle = time * .pi * 1.5
+            return (0.5 + 0.12 * cos(angle), 0.5 + 0.12 * sin(angle))
+        }
+        let irregular = sampled { time in
+            (0.5 + 0.1 * sin(time * 4.1) + 0.025 * sin(time * 17),
+             0.5 + 0.1 * cos(time * 3.3) + 0.02 * sin(time * 13))
+        }
+        let jitter = sampled { time in (0.5 + 0.0004 * sin(time * 107), 0.5 + 0.0002 * cos(time * 83)) }
+        let crossing = sampled { time in (0.1 + time * 0.2, 0.43) }
+        let zigzag = sampled { time in
+            let phase = time.truncatingRemainder(dividingBy: 2)
+            return (0.1 + 0.8 * (1 - abs(phase - 1)), 0.5)
+        }
+        let wideCircle = sampled { time in
+            let angle = time * .pi
+            return (0.5 + 0.36 * cos(angle), 0.5 + 0.36 * sin(angle))
+        }
+        let jumps = CursorTrace(samples: [
+            CursorSample(time: 0, x: 0.03, y: 0.03, inside: true, clicked: true),
+            CursorSample(time: 0.37, x: 0.97, y: 0.97, inside: true, clicked: false),
+            CursorSample(time: 0.73, x: 0.03, y: 0.97, inside: true, clicked: false),
+            CursorSample(time: 1.07, x: 0.97, y: 0.03, inside: true, clicked: false),
+            CursorSample(time: 1.43, x: 0.03, y: 0.03, inside: true, clicked: false),
+            CursorSample(time: 1.81, x: 0.97, y: 0.97, inside: true, clicked: true),
+            CursorSample(time: 2.19, x: 0.02, y: 0.98, inside: true, clicked: false),
+            CursorSample(time: 2.51, x: 0.98, y: 0.02, inside: true, clicked: false)
+        ])
+        let subframe = CursorTrace(samples: [
+            CursorSample(time: 0, x: 0.5, y: 0.5, inside: true, clicked: false),
+            CursorSample(time: 0.251, x: 0.02, y: 0.02, inside: true, clicked: true),
+            CursorSample(time: 0.263, x: 0.98, y: 0.98, inside: true, clicked: false),
+            CursorSample(time: 0.271, x: 0.02, y: 0.98, inside: true, clicked: false),
+            CursorSample(time: 0.303, x: 0.98, y: 0.02, inside: true, clicked: false)
+        ])
+        let exiting = CursorTrace(samples: [
+            CursorSample(time: 0, x: 0.9, y: 0.5, inside: true, clicked: true),
+            CursorSample(time: 0.4, x: 0.9, y: 0.5, inside: true, clicked: false),
+            CursorSample(time: 0.7, x: 0.88, y: 0.5, inside: true, clicked: false),
+            CursorSample(time: 1.05, x: -0.25, y: 0.5, inside: false, clicked: false),
+            CursorSample(time: 1.3, x: 0.05, y: 0.5, inside: true, clicked: false),
+            CursorSample(time: 1.6, x: 0.15, y: 0.5, inside: true, clicked: false),
+            CursorSample(time: 2.2, x: 0.8, y: 0.5, inside: true, clicked: true)
+        ])
+        let outsideCrossing = CursorTrace(samples: [
+            CursorSample(time: 0, x: 0.9, y: 0.6, inside: true, clicked: true),
+            CursorSample(time: 0.55, x: 0.87, y: 0.6, inside: true, clicked: false),
+            CursorSample(time: 0.8, x: -0.2, y: 0.6, inside: false, clicked: false),
+            CursorSample(time: 0.96, x: 1.2, y: 0.6, inside: false, clicked: false),
+            CursorSample(time: 1.13, x: 0.98, y: 0.6, inside: true, clicked: false),
+            CursorSample(time: 1.4, x: 0.85, y: 0.6, inside: true, clicked: false)
+        ])
+        let longCrossing = CursorTrace(samples: (0...7_200).map { index in
+            let time = Double(index) / 60
+            return CursorSample(time: time, x: 0.5 + 0.42 * sin(time * .pi / 15),
+                y: 0.5 + 0.2 * cos(time * .pi / 21), inside: true, clicked: index == 15)
+        })
+        var scenarios = [
+            Scenario(name: "local-circle", trace: circle, duration: 6, common: true, local: true, needsPan: false),
+            Scenario(name: "local-irregular", trace: irregular, duration: 6, common: true, local: true, needsPan: false),
+            Scenario(name: "stationary-jitter", trace: jitter, duration: 6, common: true, local: true, needsPan: false),
+            Scenario(name: "cross-region", trace: crossing, duration: 6, common: true, local: false, needsPan: true),
+            Scenario(name: "moderate-zigzag", trace: zigzag, duration: 6, common: true, local: false, needsPan: true),
+            Scenario(name: "wide-circle", trace: wideCircle, duration: 6, common: false, local: false, needsPan: false),
+            Scenario(name: "rapid-corners", trace: jumps, duration: 5, common: false, local: false, needsPan: false),
+            Scenario(name: "subframe-jumps", trace: subframe, duration: 3, common: false, local: false, needsPan: false),
+            Scenario(name: "exit-across-screen", trace: exiting, duration: 4.5, common: false, local: false, needsPan: false),
+            Scenario(name: "outside-cross-reentry", trace: outsideCrossing, duration: 3.5, common: false, local: false, needsPan: false),
+            Scenario(name: "long-cross-region", trace: longCrossing, duration: 120, common: false, local: false, needsPan: false)
+        ]
+        for (index, corner) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)].enumerated() {
+            scenarios.append(Scenario(name: "stationary-corner-\(index)", trace: CursorTrace(samples: [
+                CursorSample(time: 0, x: corner.0, y: corner.1, inside: true, clicked: false),
+                CursorSample(time: 0.2, x: corner.0, y: corner.1, inside: true, clicked: true)
+            ]), duration: 3.5, common: true, local: false, needsPan: false))
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        for fps in [30, 60] {
+            for scenario in scenarios {
+                let label = "\(scenario.name) \(fps)fps"
+                let originalTrace = try encoder.encode(scenario.trace)
+                let planningBegan = Date()
+                let zooms = ProjectStore.automaticZooms(trace: scenario.trace,
+                    duration: scenario.duration, fps: Int32(fps))
+                let planningDuration = Date().timeIntervalSince(planningBegan)
+                let clip = DemoClip(title: label, sourceStart: 0, duration: scenario.duration, zooms: zooms)
+                let restored = try JSONDecoder().decode([ZoomSegment].self, from: encoder.encode(zooms))
+                let reopened = DemoClip(title: label, sourceStart: 0, duration: scenario.duration, zooms: restored)
+                let largestCount = zooms.map { $0.cameraControlPoints.count }.max() ?? 0
+                if scenario.common {
+                    try check(!zooms.isEmpty && zooms.allSatisfy { (4...8).contains($0.cameraControlPoints.count) },
+                              "\(label)：普通自动镜头应保留四基础点并控制在八点以内")
+                    try check((zooms.map(\.peak).max() ?? 1) > 1.5,
+                              "\(label)：普通操作不应靠退回全景来逃避取景规划")
+                }
+                if scenario.local {
+                    try check(largestCount <= 6, "\(label)：一个取景框容得下的局部活动仍生成了太多编辑点")
+                }
+                if scenario.name == "moderate-zigzag" {
+                    try check(zooms.contains { (5...8).contains($0.cameraControlPoints.count) && $0.peak > 1.5 },
+                              "\(label)：正常跨区反向应补少量关键点并保留放大，不能一律只留四点再降低倍率")
+                }
+                if scenario.name == "long-cross-region" {
+                    try check(planningDuration <= 10 && largestCount <= 8,
+                              "\(label)：120秒轨迹规划超过十秒或仍产生八个以上的编辑点")
+                }
+                var largestViolation = 0.0
+                var totalTravel = 0.0, plateauTravel = 0.0
+                var smallestCenterX = 1.0, largestCenterX = 0.0
+                func inspect(_ time: Double, x: Double? = nil, y: Double? = nil) throws {
+                    let pose = clip.pose(at: time), savedPose = reopened.pose(at: time)
+                    try check([pose.x, pose.y, pose.scale].allSatisfy(\.isFinite) && pose.scale >= 1 && pose.scale <= 1.600000001,
+                              "\(label)：最终镜头倍率或取景位置无效")
+                    let half = 0.5 / pose.scale
+                    try check(pose.x - half >= -0.000001 && pose.y - half >= -0.000001 &&
+                              pose.x + half <= 1.000001 && pose.y + half <= 1.000001,
+                              "\(label)：最终预览取景超出原片产生黑边")
+                    try check(abs(pose.x - savedPose.x) < 0.000000001 && abs(pose.y - savedPose.y) < 0.000000001 &&
+                              abs(pose.scale - savedPose.scale) < 0.000000001,
+                              "\(label)：保存重开后实际镜头路线发生变化")
+                    if let x, let y {
+                        let violation = max(0, max(max(pose.x - half - x, x - pose.x - half),
+                                                  max(pose.y - half - y, y - pose.y - half)))
+                        largestViolation = max(largestViolation, violation)
+                        try check(violation <= 0.000001,
+                                  "\(label)：鼠标在 \(time)s 越出最终取景框 \(violation)，不能以少节点为由裁掉操作")
+                    }
+                }
+                let samples = scenario.trace.samples
+                for sample in samples where sample.time.isFinite && sample.time >= 0 && sample.time <= scenario.duration &&
+                    sample.x.isFinite && sample.y.isFinite && (0...1).contains(sample.x) && (0...1).contains(sample.y) {
+                    try inspect(sample.time, x: sample.x, y: sample.y)
+                }
+                // Check between capture samples too: frame-only checks miss
+                // clipping during zoom ramps and source-boundary crossings.
+                for (a, b) in zip(samples, samples.dropFirst()) where
+                    a.time.isFinite && b.time.isFinite && b.time > a.time &&
+                    a.x.isFinite && a.y.isFinite && b.x.isFinite && b.y.isFinite {
+                    let count = max(1, Int(ceil((b.time - a.time) * 240)))
+                    for index in 0...count {
+                        let amount = Double(index) / Double(count)
+                        let time = a.time + (b.time - a.time) * amount
+                        let x = a.x + (b.x - a.x) * amount, y = a.y + (b.y - a.y) * amount
+                        if time >= 0, time <= scenario.duration, (0...1).contains(x), (0...1).contains(y) {
+                            try inspect(time, x: x, y: y)
+                        }
+                    }
+                }
+                var previous = clip.pose(at: 0)
+                let frameCount = Int(ceil(scenario.duration * 240))
+                for index in 0...frameCount {
+                    let time = min(scenario.duration, Double(index) / 240), pose = clip.pose(at: time)
+                    try inspect(time)
+                    if let last = samples.last, last.inside, time >= last.time {
+                        try inspect(time, x: last.x, y: last.y)
+                    }
+                    let distance = hypot(pose.x - previous.x, pose.y - previous.y)
+                    totalTravel += distance
+                    if time >= 1 && time <= 3.8 && pose.scale > 1.5 && previous.scale > 1.5 {
+                        plateauTravel += distance
+                        smallestCenterX = min(smallestCenterX, pose.x)
+                        largestCenterX = max(largestCenterX, pose.x)
+                    }
+                    previous = pose
+                }
+                if scenario.local {
+                    try check(plateauTravel <= 0.2, "\(label)：局部绕圈或不规则活动仍让镜头频繁追着鼠标移动")
+                }
+                if scenario.needsPan {
+                    try check(largestCenterX - smallestCenterX > 0.08,
+                              "\(label)：跨区域操作应表现为镜头平移，不能一直固定全景")
+                }
+                for zoom in zooms {
+                    let controls = zoom.cameraControlPoints
+                    try check(controls.first?.scale == 1 && controls.last?.scale == 1 &&
+                              zip(controls, controls.dropFirst()).allSatisfy { $0.time < $1.time },
+                              "\(label)：基础端点或关键点时间顺序不正确")
+                    for (a, b) in zip(controls, controls.dropFirst()) {
+                        let start = zoom.pose(at: a.time), end = zoom.pose(at: b.time)
+                        let dx = end.x - start.x, dy = end.y - start.y, lengthSquared = dx * dx + dy * dy
+                        var priorProgress = 0.0
+                        for index in 0...16 {
+                            let time = a.time + (b.time - a.time) * Double(index) / 16
+                            let pose = zoom.pose(at: time)
+                            if lengthSquared < 0.000000000001 {
+                                try check(hypot(pose.x - start.x, pose.y - start.y) <= 0.000001,
+                                          "\(label)：同位置关键点之间仍藏着往返运动")
+                            } else {
+                                let cross = (pose.x - start.x) * dy - (pose.y - start.y) * dx
+                                let progress = ((pose.x - start.x) * dx + (pose.y - start.y) * dy) / lengthSquared
+                                try check(abs(cross) / sqrt(lengthSquared) <= 0.000001 &&
+                                          progress >= priorProgress - 0.000001 && progress >= -0.000001 && progress <= 1.000001,
+                                          "\(label)：相邻关键点之间不是单调直线运动，或存在未显示的绕行")
+                                priorProgress = progress
+                            }
+                        }
+                    }
+                    try check(!zoom.centerPath.isEmpty && zoom.manualCenterPath != nil,
+                              "\(label)：简化取景时丢掉了原始自动中心记录或稀疏编辑路线")
+                }
+                try check(try encoder.encode(scenario.trace) == originalTrace && restored == zooms,
+                          "\(label)：简化或保存重开改变了原始鼠标记录或关键点数据")
+                print(String(format: "METRIC simplified %@: maxNodes=%d, travel=%.5f, plateauTravel=%.5f, cursorViolation=%.9f, planningSeconds=%.4f",
+                             label, largestCount, totalTravel, plateauTravel, largestViolation, planningDuration))
+            }
+        }
+        print("PASS simplified motion: sparse straight paths, local stability, real pans, corner/subframe/source-boundary containment, inverse-zoom edges, 120-second planning, 30/60fps and JSON identity")
     }
 
     private static func checkSafeZone(fps: Int) throws {

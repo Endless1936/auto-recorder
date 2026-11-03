@@ -135,6 +135,7 @@ enum ProjectSelfTest {
     }
 
     static func runLogic() throws {
+        try checkSimpleCameraInterpolation()
         try checkCameraKeyframes()
         try checkAutomaticMotionLogic()
         try checkDeletedMotionSpans()
@@ -242,6 +243,39 @@ enum ProjectSelfTest {
                   repairedZoom.riseEnd < repairedZoom.fallStart && repairedZoom.fallStart < repairedZoom.end,
                   "重开时没有修复退化时序，或错误重新生成了用户镜头")
         print("PASS saved control repair: degenerate timing repaired without replacing camera identity, amplitude or pointer trace")
+    }
+
+    private static func checkSimpleCameraInterpolation() throws {
+        let points = [CameraKeyframe(time: 1, scale: 1), CameraKeyframe(time: 3, scale: 2),
+                      CameraKeyframe(time: 7, scale: 2), CameraKeyframe(time: 9, scale: 1)]
+        let centers = [ZoomCenterPoint(time: 1, x: 0.5, y: 0.5),
+                       ZoomCenterPoint(time: 3, x: 0.25, y: 0.75),
+                       ZoomCenterPoint(time: 7, x: 0.25, y: 0.75),
+                       ZoomCenterPoint(time: 9, x: 0.5, y: 0.5)]
+        let zoom = ZoomSegment(start: 1, riseEnd: 3, fallStart: 7, end: 9, peak: 2,
+            manualFocus: true, manualCenterPath: centers, cameraKeyframes: points, simpleMotion: true).normalized()
+        for index in 0...1920 {
+            let time = 1 + Double(index) / 240
+            let pose = zoom.pose(at: time), half = 0.5 / pose.scale
+            try check(abs(pose.x - half) < 0.000000001 && abs(pose.y - (1 - half)) < 0.000000001,
+                      "简化镜头的取景位置与画幅未同步，边角鼠标会在缩放途中被裁掉")
+        }
+        var inserted = zoom
+        guard inserted.addCameraKeyframe(at: 2.2) != nil else {
+            throw RecorderError.message("无法给简化镜头添加中间锚点")
+        }
+        let decoded = try JSONDecoder().decode(ZoomSegment.self, from: JSONEncoder().encode(inserted))
+        let shifted = decoded.shifted(by: -1.5)
+        for index in 0...1920 {
+            let time = 1 + Double(index) / 240
+            let expected = zoom.pose(at: time), actual = decoded.pose(at: time), cut = shifted.pose(at: time - 1.5)
+            try check(abs(actual.scale - expected.scale) < 0.000000001 &&
+                      abs(actual.x - expected.x) < 0.000000001 && abs(actual.y - expected.y) < 0.000000001 &&
+                      abs(cut.scale - expected.scale) < 0.000000001 && abs(cut.x - expected.x) < 0.000000001 &&
+                      abs(cut.y - expected.y) < 0.000000001,
+                      "无修改加点、序列化或剪切改变了简化镜头的真实路径")
+        }
+        print("PASS simple camera interpolation: edge/corner containment through inverse-scale easing, straight spatial motion, exact insertion, JSON and shifted cuts")
     }
 
     private static func checkCameraKeyframes() throws {
@@ -991,9 +1025,20 @@ enum ProjectSelfTest {
             }
             let quarter = value.start + (value.riseEnd - value.start) * 0.25
             let threeQuarter = value.start + (value.riseEnd - value.start) * 0.75
-            try check(abs(value.scale(at: quarter) - (1 + (value.peak - 1) * 0.15625)) < 0.00000001 &&
-                      abs(value.scale(at: threeQuarter) - (1 + (value.peak - 1) * 0.84375)) < 0.00000001,
-                      "\(label)：曲线不是预期的 smoothstep")
+            if value.simpleMotion == true {
+                for (a, b) in zip(value.cameraControlPoints, value.cameraControlPoints.dropFirst()) {
+                    for fraction in [0.25, 0.75] {
+                        let progress = fraction * fraction * (3 - 2 * fraction)
+                        let expected = 1 / (1 / a.scale + (1 / b.scale - 1 / a.scale) * progress)
+                        try check(abs(value.scale(at: a.time + (b.time - a.time) * fraction) - expected) < 0.00000001,
+                                  "\(label)：简化镜头未按相邻控制点平滑改变取景画幅")
+                    }
+                }
+            } else {
+                try check(abs(value.scale(at: quarter) - (1 + (value.peak - 1) * 0.15625)) < 0.00000001 &&
+                          abs(value.scale(at: threeQuarter) - (1 + (value.peak - 1) * 0.84375)) < 0.00000001,
+                          "\(label)：曲线不是预期的 smoothstep")
+            }
         }
 
         let cases = [
