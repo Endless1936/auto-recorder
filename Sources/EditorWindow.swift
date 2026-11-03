@@ -135,10 +135,18 @@ private struct EditorContent: View {
                     EditorVideoSurface(player: model.player, framingState: model.framingState,
                                        onBeginEditing: model.beginFramingEditing,
                                        onEndEditing: model.endEditing,
-                                       onMoveFrame: model.updateFramingCenter,
-                                       onMoveKeyframe: model.updateFramingKeyframe,
-                                       onSelectKeyframe: model.selectFramingAnchor,
-                                       onResizeFrame: model.updateFramingScale)
+                                       onMoveFrame: { clipID, zoomID, time, x, y in
+                                           model.updateFramingCenter(clipID: clipID, zoomID: zoomID, time: time, x: x, y: y)
+                                       },
+                                       onMoveKeyframe: { clipID, zoomID, time, x, y in
+                                           model.updateFramingKeyframe(clipID: clipID, zoomID: zoomID, time: time, x: x, y: y)
+                                       },
+                                       onSelectKeyframe: { clipID, zoomID, time in
+                                           model.selectFramingAnchor(clipID: clipID, zoomID: zoomID, at: time)
+                                       },
+                                       onResizeFrame: { clipID, zoomID, time, scale in
+                                           model.updateFramingScale(clipID: clipID, zoomID: zoomID, time: time, scale: scale)
+                                       })
                     .accessibilityIdentifier("editor.preview.surface")
                     .frame(height: previewHeight)
                     .background(AppTheme.paper)
@@ -266,10 +274,10 @@ private struct EditorVideoSurface: NSViewRepresentable {
     let framingState: FramingState?
     let onBeginEditing: () -> Void
     let onEndEditing: () -> Void
-    let onMoveFrame: (Double, Double) -> Void
-    let onMoveKeyframe: (Double, Double, Double) -> Void
-    let onSelectKeyframe: (Double) -> Void
-    let onResizeFrame: (Double) -> Void
+    let onMoveFrame: (UUID, UUID, Double, Double, Double) -> Void
+    let onMoveKeyframe: (UUID, UUID, Double, Double, Double) -> Void
+    let onSelectKeyframe: (UUID, UUID, Double) -> Void
+    let onResizeFrame: (UUID, UUID, Double, Double) -> Void
 
     func makeNSView(context: Context) -> EditorPlayerLayerView {
         let view = EditorPlayerLayerView()
@@ -298,10 +306,10 @@ private final class EditorPlayerLayerView: NSView {
     let videoLayer = AVPlayerLayer()
     var onBeginEditing: (() -> Void)?
     var onEndEditing: (() -> Void)?
-    var onMoveFrame: ((Double, Double) -> Void)?
-    var onMoveKeyframe: ((Double, Double, Double) -> Void)?
-    var onSelectKeyframe: ((Double) -> Void)?
-    var onResizeFrame: ((Double) -> Void)?
+    var onMoveFrame: ((UUID, UUID, Double, Double, Double) -> Void)?
+    var onMoveKeyframe: ((UUID, UUID, Double, Double, Double) -> Void)?
+    var onSelectKeyframe: ((UUID, UUID, Double) -> Void)?
+    var onResizeFrame: ((UUID, UUID, Double, Double) -> Void)?
     var framingState: FramingState? { didSet { updateFramingLayers() } }
 
     private let framingLayer = CALayer()
@@ -311,6 +319,7 @@ private final class EditorPlayerLayerView: NSView {
     private let frameLayer = CAShapeLayer()
     private let centerLayer = CAShapeLayer()
     private let handlesLayer = CAShapeLayer()
+    private let selectedHandlesLayer = CAShapeLayer()
     private let resizeLayer = CAShapeLayer()
     private let badgeLayer = CALayer()
     private let badgeLeadersLayer = CAShapeLayer()
@@ -324,9 +333,14 @@ private final class EditorPlayerLayerView: NSView {
     private var drag: FramingDrag?
 
     private struct FramingDrag {
-        var origin: CGPoint
-        var center: CGPoint
-        var time: Double?
+        enum Kind: Equatable { case frame, keyframe, resize }
+        let origin: CGPoint
+        let center: CGPoint
+        let videoSize: CGSize
+        let clipID: UUID
+        let zoomID: UUID
+        let time: Double
+        let kind: Kind
         var resizeScale: Double?
         var resizeVector: CGPoint?
     }
@@ -344,6 +358,7 @@ private final class EditorPlayerLayerView: NSView {
         framingLayer.addSublayer(frameLayer)
         framingLayer.addSublayer(centerLayer)
         framingLayer.addSublayer(handlesLayer)
+        framingLayer.addSublayer(selectedHandlesLayer)
         framingLayer.addSublayer(badgeLeadersLayer)
         framingLayer.addSublayer(badgeLayer)
         framingLayer.addSublayer(resizeLayer)
@@ -376,6 +391,7 @@ private final class EditorPlayerLayerView: NSView {
         centerLayer.fillColor = nil
         centerLayer.lineWidth = 1
         handlesLayer.lineWidth = 2
+        selectedHandlesLayer.lineWidth = 2
         addSubview(pathRegion)
         addSubview(frameRegion)
         for index in 0..<4 {
@@ -401,51 +417,60 @@ private final class EditorPlayerLayerView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard let state = framingState, state.canEdit || state.canResize || state.canSelectAnchors else { return }
+        guard let state = framingState, let zoomID = state.zoomID,
+              state.canEdit || state.canResize || state.canSelectAnchors else { return }
         let point = convert(event.locationInWindow, from: nil)
         let rect = videoLayer.videoRect
         guard rect.width > 0, rect.height > 0, rect.insetBy(dx: -14, dy: -14).contains(point), point.y > 58 else { return }
         let crop = cropRect(for: state, in: rect)
         let corners = FramingOverlayGeometry.resizeHandleCenters(in: crop)
-        if state.canResize, let corner = corners.min(by: { distance(point, $0) < distance(point, $1) }),
+        // A numbered badge names one exact time even when several centers
+        // coincide. Give its visible bounds priority over a resize corner.
+        let badgeIndex = nearestBadge(to: point, state: state, in: rect)
+        if let index = badgeIndex {
+            let handle = state.handles[index]
+            drag = FramingDrag(origin: point, center: CGPoint(x: handle.x, y: handle.y), videoSize: rect.size,
+                               clipID: state.clipID, zoomID: zoomID, time: handle.time, kind: .keyframe)
+        } else if state.canResize, let corner = corners.min(by: { distance(point, $0) < distance(point, $1) }),
            distance(point, corner) <= 14 {
             let center = CGPoint(x: rect.minX + CGFloat(state.pose.x) * rect.width,
                                  y: rect.maxY - CGFloat(state.pose.y) * rect.height)
-            drag = FramingDrag(origin: point, center: center, resizeScale: state.pose.scale,
+            drag = FramingDrag(origin: point, center: center, videoSize: rect.size,
+                               clipID: state.clipID, zoomID: zoomID, time: state.localTime, kind: .resize,
+                               resizeScale: state.pose.scale,
                                resizeVector: CGPoint(x: (corner.x - center.x) / rect.width,
                                                      y: (corner.y - center.y) / rect.height))
         } else if let index = nearestHandle(to: point, state: state, in: rect) {
             let handle = state.handles[index]
-            drag = FramingDrag(origin: point, center: CGPoint(x: handle.x, y: handle.y), time: handle.time)
+            drag = FramingDrag(origin: point, center: CGPoint(x: handle.x, y: handle.y), videoSize: rect.size,
+                               clipID: state.clipID, zoomID: zoomID, time: handle.time, kind: .keyframe)
         } else if state.canEdit, crop.insetBy(dx: -7, dy: -7).contains(point) {
-            drag = FramingDrag(origin: point, center: CGPoint(x: state.pose.x, y: state.pose.y))
+            drag = FramingDrag(origin: point, center: CGPoint(x: state.pose.x, y: state.pose.y), videoSize: rect.size,
+                               clipID: state.clipID, zoomID: zoomID, time: state.localTime, kind: .frame)
         }
-        if drag != nil {
+        if let drag {
             onBeginEditing?()
-            if let time = drag?.time { onSelectKeyframe?(time) }
+            if drag.kind == .keyframe { onSelectKeyframe?(drag.clipID, drag.zoomID, drag.time) }
             NSCursor.closedHand.push()
         }
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let drag, let state = framingState else { return }
-        let rect = videoLayer.videoRect
-        guard rect.width > 0, rect.height > 0 else { return }
+        guard let drag, let state = framingState, state.canSelectAnchors,
+              drag.videoSize.width > 0, drag.videoSize.height > 0 else { return }
         let point = convert(event.locationInWindow, from: nil)
         if let scale = drag.resizeScale, let vector = drag.resizeVector {
-            guard state.canResize else { return }
-            let dx = (point.x - drag.origin.x) / rect.width
-            let dy = (point.y - drag.origin.y) / rect.height
+            let dx = (point.x - drag.origin.x) / drag.videoSize.width
+            let dy = (point.y - drag.origin.y) / drag.videoSize.height
             let denominator = max(0.000001, vector.x * vector.x + vector.y * vector.y)
             let ratio = max(0.01, 1 + (dx * vector.x + dy * vector.y) / denominator)
-            onResizeFrame?(min(3, max(1, scale / Double(ratio))))
+            onResizeFrame?(drag.clipID, drag.zoomID, drag.time, min(3, max(1, scale / Double(ratio))))
             return
         }
-        guard state.canEdit else { return }
-        let x = Double(drag.center.x + (point.x - drag.origin.x) / rect.width)
-        let y = Double(drag.center.y - (point.y - drag.origin.y) / rect.height)
-        if let time = drag.time { onMoveKeyframe?(time, x, y) }
-        else { onMoveFrame?(x, y) }
+        let x = Double(drag.center.x + (point.x - drag.origin.x) / drag.videoSize.width)
+        let y = Double(drag.center.y - (point.y - drag.origin.y) / drag.videoSize.height)
+        if drag.kind == .keyframe { onMoveKeyframe?(drag.clipID, drag.zoomID, drag.time, x, y) }
+        else { onMoveFrame?(drag.clipID, drag.zoomID, drag.time, x, y) }
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -515,14 +540,22 @@ private final class EditorPlayerLayerView: NSView {
         centerLayer.path = cross
         centerLayer.strokeColor = accent
         let handles = CGMutablePath()
+        let selectedHandles = CGMutablePath()
         for handle in state.handles {
             let point = sourcePoint(handle, in: rect)
             handles.addEllipse(in: CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10))
+            if state.selectedHandleTimes.contains(where: { abs($0 - handle.time) < 0.000001 }) {
+                selectedHandles.addEllipse(in: CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10))
+            }
         }
         handlesLayer.path = handles
         handlesLayer.fillColor = NSColor(AppTheme.paper).cgColor
         handlesLayer.strokeColor = accent
         handlesLayer.opacity = state.canSelectAnchors ? 1 : 0.55
+        selectedHandlesLayer.path = selectedHandles
+        selectedHandlesLayer.fillColor = accent
+        selectedHandlesLayer.strokeColor = accent
+        selectedHandlesLayer.opacity = handlesLayer.opacity
         let badgePoints = badgeCenters(for: state, in: rect)
         let leaders = CGMutablePath()
         while badgeLabels.count < state.handles.count {
@@ -617,14 +650,25 @@ private final class EditorPlayerLayerView: NSView {
         FramingOverlayGeometry.handleBadgeCenters(points: state.handles.map { sourcePoint($0, in: rect) }, bounds: rect)
     }
 
+    private func nearestBadge(to point: CGPoint, state: FramingState, in rect: CGRect) -> Int? {
+        FramingOverlayGeometry.badgeIndex(at: point, centers: badgeCenters(for: state, in: rect))
+    }
+
     private func nearestHandle(to point: CGPoint, state: FramingState, in rect: CGRect) -> Int? {
         let badges = badgeCenters(for: state, in: rect)
+        if let index = FramingOverlayGeometry.badgeIndex(at: point, centers: badges) { return index }
         let candidates = state.handles.indices.map { index in
             (index: index, distance: min(distance(point, badges[index]), distance(point, sourcePoint(state.handles[index], in: rect))))
         }.filter { $0.distance <= 14 }
         return candidates.min {
             if abs($0.distance - $1.distance) > 0.5 { return $0.distance < $1.distance }
-            return abs(state.handles[$0.index].time - state.localTime) < abs(state.handles[$1.index].time - state.localTime)
+            let lhs = state.handles[$0.index], rhs = state.handles[$1.index]
+            let lhsSelected = state.selectedHandleTimes.contains { abs($0 - lhs.time) < 0.000001 }
+            let rhsSelected = state.selectedHandleTimes.contains { abs($0 - rhs.time) < 0.000001 }
+            if lhsSelected != rhsSelected { return lhsSelected }
+            let lhsTime = abs(lhs.time - state.localTime), rhsTime = abs(rhs.time - state.localTime)
+            if abs(lhsTime - rhsTime) > 0.000001 { return lhsTime < rhsTime }
+            return $0.index < $1.index
         }?.index
     }
 
@@ -648,6 +692,16 @@ private final class EditorPlayerLayerView: NSView {
 }
 
 enum FramingOverlayGeometry {
+    static func badgeIndex(at point: CGPoint, centers: [CGPoint]) -> Int? {
+        centers.indices.filter {
+            CGRect(x: centers[$0].x - 9, y: centers[$0].y - 9, width: 18, height: 18).contains(point)
+        }.min {
+            let lhs = hypot(point.x - centers[$0].x, point.y - centers[$0].y)
+            let rhs = hypot(point.x - centers[$1].x, point.y - centers[$1].y)
+            return abs(lhs - rhs) > 0.000001 ? lhs < rhs : $0 < $1
+        }
+    }
+
     static func resizeHandleCenters(in rect: CGRect) -> [CGPoint] {
         // Keep full-view controls inside the video surface's hit-test bounds.
         corners(of: rect.insetBy(dx: 4, dy: 4))

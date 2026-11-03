@@ -32,6 +32,7 @@ enum ProjectSelfTest {
         try await checkOverlappingLoads(olderFolder: folder, source: fixtureURL,
                                         duration: sourceDuration, directory: directory)
         try await checkFramingPreview(source: fixtureURL, duration: sourceDuration, directory: directory)
+        try await checkAutomaticMotionEditing(source: fixtureURL, duration: sourceDuration, directory: directory)
         try await checkCameraAnchorEditing(source: fixtureURL, duration: sourceDuration, directory: directory)
         try await checkCameraAnchorBatchEditing(source: fixtureURL, duration: sourceDuration, directory: directory)
         try await checkCameraAnchorDeletion(source: fixtureURL, duration: sourceDuration, directory: directory)
@@ -134,6 +135,7 @@ enum ProjectSelfTest {
 
     static func runLogic() throws {
         try checkCameraKeyframes()
+        try checkAutomaticMotionLogic()
         try checkCameraAnchorDragging()
         try checkCameraSelectionDeletion()
         try checkFramingPaths()
@@ -311,12 +313,92 @@ enum ProjectSelfTest {
         let dense = (0...50).map { ZoomCenterPoint(time: Double($0) / 10, x: 0.4 + Double($0) / 250, y: 0.5) }
         var collision = ZoomSegment(start: 0, riseEnd: 1, fallStart: 4, end: 5, peak: 1.6, centerPath: dense)
         let control = collision.addCameraKeyframe(at: 2)!
+        let originalCenter = collision.pose(at: 2)
         collision.updateCameraKeyframe(id: control.id, time: 2.5, scale: 1.6)
-        try check(collision.centerPath.filter { abs($0.time - 2.5) < 0.000001 }.count == 1 &&
-                  collision.centerPath.first(where: { abs($0.time - 2.5) < 0.000001 })?.x == dense[20].x &&
-                  dense.filter { abs($0.time - 2) > 0.000001 && abs($0.time - 2.5) > 0.000001 }.allSatisfy { collision.centerPath.contains($0) },
-                  "锚点移到原路径采样时间时未正确合并，或覆盖了其他原路径点")
+        try check(collision.centerPath == dense &&
+                  abs(collision.pose(at: 2.5).x - originalCenter.x) < 0.0000001 &&
+                  abs(collision.pose(at: 2.5).y - originalCenter.y) < 0.0000001,
+                  "移动锚点时间修改了原始自动路径，或未保留该锚点的取景位置")
         print("PASS camera anchors: exact nondestructive insertion, arbitrary independent scales, smooth bounded spans, original motion retention, stable persistence, timing linkage and cut-domain preservation")
+    }
+
+    private static func checkAutomaticMotionLogic() throws {
+        func matches(_ a: DemoZoomPose, _ b: DemoZoomPose) -> Bool {
+            abs(a.scale - b.scale) < 0.0000001 && abs(a.x - b.x) < 0.0000001 && abs(a.y - b.y) < 0.0000001
+        }
+        for circular in [true, false] {
+            let path = (0...180).map { index -> ZoomCenterPoint in
+                let time = Double(index) / 30
+                let phase = (time - 1) * .pi / 2
+                let x = circular ? 0.5 + 0.12 * cos(phase) : 0.5 + 0.1 * sin(5.3 * time) + 0.025 * sin(19 * time)
+                let y = circular ? 0.5 + 0.1 * sin(phase) : 0.5 + 0.08 * cos(3.7 * time) + 0.03 * sin(13 * time)
+                return ZoomCenterPoint(time: time, x: x, y: y)
+            }
+            let original = ZoomSegment(start: 0, riseEnd: 1, fallStart: 5, end: 6, peak: 1.8, centerPath: path).normalized()
+            let controls = original.cameraControlPoints
+            try check(controls.count > 4 && controls.count < path.count &&
+                      controls.map(\.id) == original.cameraControlPoints.map(\.id) &&
+                      zip(controls, controls.dropFirst()).allSatisfy { pair in pair.0.time < pair.1.time },
+                      "复杂自动路线没有生成稳定、按时间排序的稀疏编辑锚点")
+            if circular {
+                let a = original.framingKeyframes.first { abs($0.time - 1) < 0.000001 }
+                let b = original.framingKeyframes.first { abs($0.time - 5) < 0.000001 }
+                try check(a != nil && b != nil && abs(a!.x - b!.x) < 0.0000001 && abs(a!.y - b!.y) < 0.0000001,
+                          "打圈路线中同位置、不同时间的节点被错误合并")
+            }
+            var edited = original
+            edited.enableCameraKeyframes()
+            for time in [1.73, 2.137, 4.321] { _ = edited.addCameraKeyframe(at: time) }
+            for time in stride(from: 0.0, through: 6.0, by: 0.013) {
+                try check(matches(original.pose(at: time), edited.pose(at: time)),
+                          "启用编辑节点或添加未修改节点改变了打圈/不规则自动运动")
+            }
+            try check(edited.centerPath == path && edited.framingKeyframes.count == edited.cameraControlPoints.count,
+                      "自动路线基底被替换，或预览节点与时间轴节点不统一")
+        }
+
+        let path = (0...180).map { ZoomCenterPoint(time: Double($0) / 30, x: 0.5, y: 0.5) }
+        let original = ZoomSegment(start: 0, riseEnd: 1, fallStart: 5, end: 6, peak: 1.8, centerPath: path).normalized()
+        var edited = original
+        let moved = edited.addCameraKeyframe(at: 2)!
+        edited.setFramingCenter(x: 0.62, y: 0.46, at: 2)
+        try check(edited.centerPath == path && abs(edited.pose(at: 2).x - 0.62) < 0.0000001 &&
+                  abs(edited.pose(at: 2).y - 0.46) < 0.0000001,
+                  "自动轨迹节点拖动覆盖了原始路线，或没有达到目标取景位置")
+        try check(edited.pose(at: 1.5).x > 0.54 && edited.pose(at: 3.5).x > 0.54 &&
+                  edited.pose(at: 2 - 1.0 / 30).x > 0.61 && edited.pose(at: 2 + 1.0 / 30).x > 0.61,
+                  "拖动自动节点仍然只影响单帧，未平滑影响相邻节点之间的运动")
+        for time in [0.0, 0.5, 1.0, 5.0, 5.5, 6.0] {
+            try check(matches(edited.pose(at: time), original.pose(at: time)), "局部轨迹修正改变了相邻锚点区间外的画面")
+        }
+        let beforeInsertion = edited
+        _ = edited.addCameraKeyframe(at: 2.71)
+        for time in stride(from: 0.0, through: 6.0, by: 0.011) {
+            try check(matches(edited.pose(at: time), beforeInsertion.pose(at: time)),
+                      "在已编辑路线中添加节点改变了已有运动")
+        }
+        let oldPose = edited.pose(at: 2)
+        edited.updateCameraKeyframe(id: moved.id, time: 2.4, scale: 1.8)
+        try check(edited.centerPath == path && matches(edited.pose(at: 2.4), oldPose) &&
+                  edited.centerOffsets?.contains(where: { abs($0.time - 2.4) < 0.000001 }) == true &&
+                  edited.centerOffsets?.contains(where: { abs($0.time - 2) < 0.000001 }) == false,
+                  "自动轨迹节点的时间、位置和局部修正没有同步移动")
+        let decoded = try JSONDecoder().decode(ZoomSegment.self, from: JSONEncoder().encode(edited))
+        let shifted = decoded.shifted(by: -1.3).normalized()
+        try check(decoded == edited, "自动轨迹局部修正未完整持久化")
+        for time in stride(from: 0.0, through: 4.5, by: 0.017) {
+            try check(matches(shifted.pose(at: time), edited.pose(at: time + 1.3)),
+                      "剪切偏移改变了自动轨迹的局部修正")
+        }
+        var deleted = beforeInsertion
+        deleted.removeCameraKeyframes(ids: [moved.id])
+        try check(deleted.centerPath == path && !deleted.cameraControlPoints.contains(where: { $0.id == moved.id }) &&
+                  deleted.centerOffsets?.contains(where: { abs($0.time - 2) < 0.000001 }) != true,
+                  "删除自动运动节点残留局部修正或修改了原始路线")
+        for time in stride(from: 0.0, through: 6.0, by: 0.019) {
+            try check(matches(deleted.pose(at: time), original.pose(at: time)), "删除唯一位置修正节点没有恢复原始自动路线")
+        }
+        print("PASS automatic motion: circular/irregular paths, stable chronological controls, exact no-op insertion before/after edits, smooth local correction, immutable base, linked time move/delete, persistence and shifted cuts")
     }
 
     private static func checkCameraAnchorDragging() throws {
@@ -832,15 +914,19 @@ enum ProjectSelfTest {
             ZoomCenterPoint(time: 7, x: 0.5, y: 0.5)]
         let original = ZoomSegment(start: -1, riseEnd: 0.5, fallStart: 5, end: 7, peak: 2,
                                    centerPath: trace)
+        let leftBoundary = original.cameraControlPoints.last(where: { $0.time < 3 })!.time
+        let rightBoundary = original.cameraControlPoints.first(where: { $0.time > 3 })!.time
         var automatic = original
         automatic.setFramingCenter(x: 4, y: -3, at: 3)
-        try check(automatic.centerPath.count == trace.count + 1 &&
-                  trace.allSatisfy { automatic.centerPath.contains($0) } && !automatic.manualFocus,
+        try check(automatic.centerPath == trace &&
+                  automatic.centerOffsets?.contains(where: { abs($0.time - 3) < 0.000001 }) == true && !automatic.manualFocus,
                   "编辑单个中心点丢失了原轨迹或把整段变成固定焦点")
         try check(automatic.pose(at: 3).x == 0.75 && automatic.pose(at: 3).y == 0.25,
                   "取景框没有限制在完整原画内")
-        for time in [0.0, 0.2, 1.0, 4.5, 5.5, 6.0] {
-            try check(automatic.pose(at: time) == original.pose(at: time), "局部中心编辑修改了相邻关键点之外的轨迹")
+        for time in stride(from: -1.0, through: 7.0, by: 0.1) where time <= leftBoundary || time >= rightBoundary {
+            let before = original.pose(at: time), after = automatic.pose(at: time)
+            try check(abs(before.x - after.x) < 0.0000001 && abs(before.y - after.y) < 0.0000001 &&
+                      abs(before.scale - after.scale) < 0.0000001, "局部中心编辑修改了相邻关键点之外的轨迹")
         }
         try check(automatic.start == -1 && automatic.end == 7 && automatic.centerPath.first?.time == -1 &&
                   automatic.centerPath.last?.time == 7, "切片的片外路径或缓动域被裁掉")
@@ -928,9 +1014,14 @@ enum ProjectSelfTest {
         try await waitForFraming(model, enabled: true)
         try check(try Data(contentsOf: project.jsonURL) == beforeJSON, "丢弃过时的取景预览修改了工程JSON")
         guard let state = model.framingState else { throw RecorderError.message("取景辅助没有生成可编辑状态。") }
-        try check(state.canEdit && state.handles.count <= 5 && state.pathSamples.count <= 80 &&
+        try check(state.canEdit && !state.handles.isEmpty && state.pathSamples.count >= state.handles.count &&
                   state.pose == model.activePose && state.normalizedRect.minX >= 0 && state.normalizedRect.maxX <= 1,
                   "取景辅助几何或稀疏控制点无效")
+        for handle in state.handles {
+            try check(state.pathSamples.contains(where: { abs($0.time - handle.time) < 0.000001 &&
+                abs($0.x - handle.x) < 0.000001 && abs($0.y - handle.y) < 0.000001 }),
+                "自动轨迹绘线漏过了实际显示节点")
+        }
 
         let originalClips = model.clips
         let framingPlayerItem = model.player.currentItem
@@ -1066,6 +1157,76 @@ enum ProjectSelfTest {
                   "重叠放大时丢弃了用户选中的有效编辑目标")
         model.clips = originalClips
         print("PASS framing preview: default off, rapid paused/playing toggles preserve player state and JSON, stale same/across-clip selections allow current-frame drag with autosave/reopen/one Undo, full-view guard, overlap selection and real camera-rendered export")
+    }
+
+    private static func checkAutomaticMotionEditing(source: URL, duration: Double, directory: URL) async throws {
+        let folder = directory.appendingPathComponent("自动轨迹编辑回归", isDirectory: true)
+        let trace = CursorTrace(samples: [CursorSample(time: 1, x: 0.4, y: 0.6, inside: true, clicked: true)])
+        var project = try ProjectStore.create(directory: folder, rawURL: source, trace: trace, fps: 30,
+            quality: .hevc, duration: duration, pixelSize: CGSize(width: 640, height: 360), autoZoomEnabled: false)
+        let path = (0...150).map { index -> ZoomCenterPoint in
+            let time = Double(index) / 30
+            let phase = (time - 1) * 2 * .pi / 3
+            return ZoomCenterPoint(time: time, x: 0.5 + 0.12 * cos(phase), y: 0.5 + 0.1 * sin(phase))
+        }
+        let zoom = ZoomSegment(start: 0, riseEnd: 1, fallStart: 4, end: 5, peak: 1.8, centerPath: path).normalized()
+        project.clips[0].zooms = [zoom]
+        project.selectedZoomID = zoom.id
+        try ProjectStore.save(project)
+        let raw = try Data(contentsOf: project.sourceURL)
+        let json = try Data(contentsOf: project.jsonURL)
+        let model = EditorModel()
+        try await model.loadProject(folder: folder)
+        model.seek(2.117)
+        model.setShowsFramingOverlay(true)
+        try await waitForFraming(model, enabled: true)
+        try check(try Data(contentsOf: project.jsonURL) == json, "仅查看自动路线改写了工程")
+        func checkVisiblePoints() throws {
+            guard let state = model.framingState, let active = model.selectedZoom else {
+                throw RecorderError.message("自动路线未生成取景节点。")
+            }
+            try check(state.handles.count == active.cameraControlPoints.count && state.pose == model.activePose,
+                      "预览节点与下方倍率节点不同步，或取景框没有使用实际播放姿态")
+            for handle in state.handles {
+                try check(active.cameraControlPoints.contains(where: { abs($0.time - handle.time) < 0.000001 }) &&
+                          state.pathSamples.contains(where: { abs($0.time - handle.time) < 0.000001 &&
+                              abs($0.x - handle.x) < 0.000001 && abs($0.y - handle.y) < 0.000001 }),
+                          "密集自动轨迹的圆点脱离虚线，或显示了并非真实控制点的采样点")
+            }
+        }
+        try checkVisiblePoints()
+        let before = model.clips
+        let item = model.player.currentItem
+        let pose = model.activePose
+        model.beginEditing()
+        model.updateFramingKeyframe(time: 2.117, x: pose.x + 0.03, y: pose.y - 0.025)
+        model.endEditing()
+        try checkVisiblePoints()
+        let edited = model.clips
+        try check(edited != before && model.selectedZoom!.centerPath == path && model.player.currentItem === item &&
+                  abs(model.activePose.x - pose.x - 0.03) < 0.0000001 &&
+                  abs(model.activePose.y - pose.y + 0.025) < 0.0000001,
+                  "密集自动路线编辑没有修改实际取景位置，或覆盖了基底/重载了播放器")
+        let saved = try ProjectStore.load(folder: folder)
+        let reopened = EditorModel()
+        try await reopened.loadProject(folder: folder)
+        try check(saved.clips == edited && reopened.clips == edited &&
+                  (try Data(contentsOf: saved.sourceURL)) == raw && saved.trace.samples.count == trace.samples.count &&
+                  saved.trace.samples[0].x == trace.samples[0].x,
+                  "自动路线编辑没有保存重开，或改变了原片与鼠标记录")
+        model.selectFramingAnchor(at: 2.117)
+        try check(model.selectedCameraAnchorIDs.count == 1 && model.canDeleteSelection && model.deleteSelected() &&
+                  model.clips.count == before.count && model.selectedZoom!.centerPath == path,
+                  "自动路线节点选择或删除失败，或误改素材/原始路线")
+        model.undo()
+        try check(model.clips == edited && model.selectedCameraAnchorIDs.count == 1,
+                  "自动路线节点删除未由一次撤销恢复修改及选择")
+        try checkVisiblePoints()
+        model.undo()
+        try check(model.clips == before && model.player.currentItem === item &&
+                  (try ProjectStore.load(folder: folder).clips) == before,
+                  "一次轨迹拖动未完整撤销并保存，或重载了原片")
+        print("PASS automatic motion editing: dense circular preview/curve identity, exact visible handles, raw player retention, original media/trace, persisted offsets, node delete and single-gesture Undo")
     }
 
     private static func checkCameraAnchorEditing(source: URL, duration: Double, directory: URL) async throws {

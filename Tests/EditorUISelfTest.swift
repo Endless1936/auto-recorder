@@ -201,6 +201,8 @@ enum EditorUISelfTest {
             try await checkFramingOverlay(original: focusable)
             try await checkFramingStaleSelection(original: focusable)
             try await checkCameraAnchors(original: focusable)
+            try await checkAutomaticCircularPath(original: focusable)
+            try await checkAutomaticCircularPath(original: focusable, irregular: true)
             try await checkCameraCurveSelection(original: focusable)
             try await checkTargetAwareDelete(original: focusable)
             if addedZoom {
@@ -264,7 +266,8 @@ enum EditorUISelfTest {
             try await drag(from: frameGrab, to: NSPoint(x: frameGrab.x + dx, y: frameGrab.y))
             try require(model.clips != original &&
                         (model.selectedZoom?.centerPath != beforeFrameZoom?.centerPath ||
-                         model.selectedZoom?.manualCenterPath != beforeFrameZoom?.manualCenterPath) &&
+                         model.selectedZoom?.manualCenterPath != beforeFrameZoom?.manualCenterPath ||
+                         model.selectedZoom?.centerOffsets != beforeFrameZoom?.centerOffsets) &&
                         (model.selectedZoom?.centerPath.isEmpty == false || model.selectedZoom?.manualCenterPath?.isEmpty == false),
                         "Native framing-frame drag did not change and retain the selected zoom's center path.")
             try require(try persistedClips() == model.clips, "Native frame drag was not saved in project.json.")
@@ -283,6 +286,7 @@ enum EditorUISelfTest {
             let preview = try frame("editor.preview.surface")
             var handleTarget: (handle: ZoomCenterPoint, point: NSPoint)?
             for (index, handle) in (model.framingState?.handles ?? []).enumerated() {
+                guard (model.selectedZoom?.scale(at: handle.time) ?? 1) > 1.000001 else { continue }
                 let point = center(try frame("editor.framing.handle.\(index)"))
                 if point.y > preview.minY + 60 && preview.insetBy(dx: 14, dy: 14).contains(point) {
                     handleTarget = (handle, point)
@@ -298,7 +302,8 @@ enum EditorUISelfTest {
             try await drag(from: handleGrab, to: NSPoint(x: handleGrab.x + handleDX, y: handleGrab.y))
             try require(model.clips != original &&
                         (model.selectedZoom?.centerPath != beforeHandleZoom?.centerPath ||
-                         model.selectedZoom?.manualCenterPath != beforeHandleZoom?.manualCenterPath),
+                         model.selectedZoom?.manualCenterPath != beforeHandleZoom?.manualCenterPath ||
+                         model.selectedZoom?.centerOffsets != beforeHandleZoom?.centerOffsets),
                         "Native path-handle drag did not change the selected zoom's center path.")
             try require(try persistedClips() == model.clips, "Native path-handle drag was not saved in project.json.")
             try screenshot("framing-path-handle-drag")
@@ -633,6 +638,129 @@ enum EditorUISelfTest {
             try await model.rebuildPreview()
             await refreshDisplayedLayout()
             try require(model.clips == original, "Camera-anchor test fixture left edits behind.")
+        }
+
+        func checkAutomaticCircularPath(original: [DemoClip], irregular: Bool = false) async throws {
+            guard let targetIndex = original.indices.max(by: { original[$0].duration < original[$1].duration }),
+                  original[targetIndex].duration >= 2 else {
+                throw failure("Automatic circular-path interactions require a source clip of at least two seconds.")
+            }
+            let began = Date()
+            let previousClipID = model.selectedClipID
+            let previousZoomID = model.selectedZoomID
+            let previousTime = model.playhead
+            let duration = original[targetIndex].duration
+            let clipID = original[targetIndex].id
+            let offset = model.startTime(of: clipID)
+            let scenario = irregular ? "irregular" : "circle"
+            var path = (0...Int(floor(duration * 30))).map { index -> ZoomCenterPoint in
+                let time = Double(index) / 30
+                let progress = time / duration
+                let phase = progress + (irregular ? 0.1 * sin(progress * 2 * Double.pi) : 0)
+                let angle = phase * 2 * Double.pi
+                return ZoomCenterPoint(time: time,
+                    x: 0.5 + 0.11 * cos(angle) + (irregular ? 0.035 * sin(3 * angle) : 0),
+                    y: 0.5 + 0.11 * sin(angle) + (irregular ? 0.025 * sin(5 * angle) : 0))
+            }
+            if duration - (path.last?.time ?? 0) > 0.000001 {
+                path.append(ZoomCenterPoint(time: duration, x: 0.61, y: 0.5))
+            }
+            let zoom = ZoomSegment(start: 0, riseEnd: duration * 0.12,
+                fallStart: duration * 0.88, end: duration, peak: 1.8, centerPath: path).normalized()
+            let controls = zoom.cameraControlPoints
+            try require(zoom.cameraKeyframes == nil && controls.count > 4,
+                        "A dense automatic circle did not expose meaningful controls beyond its four scale stages.")
+            let candidates = controls.indices.filter { index in
+                index > 0 && index < controls.count - 1 &&
+                    controls[index].time >= duration * 0.24 && controls[index].time <= duration * 0.76 &&
+                    controls[index].time - controls[index - 1].time > 0.08 &&
+                    controls[index + 1].time - controls[index].time > 0.08
+            }
+            guard let target = candidates.min(by: {
+                abs(controls[$0].time - duration / 2) < abs(controls[$1].time - duration / 2)
+            }) else { throw failure("The automatic circle has no interior control with independently testable neighboring intervals.") }
+            let control = controls[target]
+            var fixture = original
+            fixture[targetIndex].zooms = [zoom]
+            model.clips = fixture
+            model.selectedClipID = clipID
+            model.selectedZoomID = zoom.id
+            model.seek(offset + duration * 0.2)
+            try model.autosave()
+            try await model.rebuildPreview()
+            try await click("editor.framing.toggle")
+            try await waitUntil("The automatic circle did not prepare its framing controls.") {
+                self.model.isFramingPreviewReady && self.model.framingState?.handles.count == controls.count
+            }
+
+            let coincident = Array(repeating: CGPoint(x: 150, y: 150), count: 6)
+            let badges = FramingOverlayGeometry.handleBadgeCenters(points: coincident,
+                bounds: CGRect(x: 0, y: 0, width: 300, height: 300))
+            for index in badges.indices {
+                try require(FramingOverlayGeometry.badgeIndex(at: badges[index], centers: badges) == index,
+                            "Coincident centers do not retain independently hittable numbered badges.")
+            }
+
+            let identifier = try cameraHandleIdentifier(at: control.time)
+            try await click(identifier)
+            try require(model.selectedClipID == clipID && model.selectedZoomID == zoom.id &&
+                        model.editingSelectionTarget == .cameraAnchors &&
+                        model.selectedCameraAnchorIDs == [control.id] &&
+                        abs(model.activeLocalTime - control.time) < 0.02,
+                        "Clicking an automatic path badge did not select and seek its matching curve control.")
+            _ = try frame("editor.zoom.\(zoom.id.uuidString).node.\(target)")
+            let grab = center(try frame(identifier))
+            let source = try framingSourceFrame()
+            let before = zoom.pose(at: control.time)
+            let dx = source.width * (before.x <= 0.5 ? 0.045 : -0.045)
+            try await dragFramingSlowly(from: grab, to: NSPoint(x: grab.x + dx, y: grab.y))
+            guard let edited = model.selectedZoom, let state = model.framingState else {
+                throw failure("Dragging an automatic circle control lost its selected segment or overlay.")
+            }
+            try require(edited.centerPath == path && !edited.manualFocus && edited.centerOffsets?.isEmpty == false,
+                        "A native automatic-path drag overwrote its original dense center path or failed to store a correction.")
+            try require(model.selectedClipID == clipID && model.selectedZoomID == zoom.id &&
+                        model.selectedCameraAnchorIDs == [control.id] &&
+                        abs(model.activeLocalTime - control.time) < 0.02 &&
+                        abs(edited.pose(at: control.time).x - before.x) > 0.02,
+                        "A held native drag changed node identity/time or failed to move its selected control.")
+            for neighbor in [controls[target - 1].time, controls[target + 1].time] {
+                let middle = (neighbor + control.time) / 2
+                let oldMiddle = zoom.pose(at: middle), newMiddle = edited.pose(at: middle)
+                try require(abs(newMiddle.x - oldMiddle.x) > 0.003,
+                            "Automatic control movement affected only one dense frame instead of its adjacent interval.")
+                let oldBoundary = zoom.pose(at: neighbor), newBoundary = edited.pose(at: neighbor)
+                try require(abs(newBoundary.x - oldBoundary.x) < 0.000001 &&
+                            abs(newBoundary.y - oldBoundary.y) < 0.000001,
+                            "Local automatic movement displaced an unchanged neighboring control.")
+            }
+            for handle in state.handles {
+                try require(state.pathSamples.contains(where: {
+                    abs($0.time - handle.time) < 0.000001 &&
+                        abs($0.x - handle.x) < 0.000001 && abs($0.y - handle.y) < 0.000001
+                }), "The visible automatic route missed an exact numbered control center.")
+            }
+            try require(try persistedClips() == model.clips, "The native automatic-path correction was not saved.")
+            try screenshot("framing-automatic-\(scenario)-control-drag")
+            try await undo()
+            let savedUndo = try persistedClips()
+            try require(model.clips == fixture && savedUndo == fixture,
+                        "One native Undo did not restore the exact automatic circle and its saved data.")
+            record("framing-automatic-\(scenario)-numbered-control-drag", began,
+                   "A 30 Hz \(scenario) route exposed real controls; native badge selection and a held mouse drag retained curve identity and original samples, changed both adjacent intervals, kept every handle on the displayed path and saved one undoable correction.")
+
+            try await click("editor.framing.toggle")
+            try await waitUntil("The automatic circle did not restore processed preview.") {
+                !self.model.showsFramingOverlay && self.model.previewCameraEffectsEnabled
+            }
+            model.clips = original
+            model.selectedClipID = previousClipID
+            model.selectedZoomID = previousZoomID
+            model.seek(previousTime)
+            try model.autosave()
+            try await model.rebuildPreview()
+            await refreshDisplayedLayout()
+            try require(model.clips == original, "The automatic circular-path fixture left edits behind.")
         }
 
         func resizeCurrentFrame(radialFactor: CGFloat) async throws {
@@ -991,26 +1119,27 @@ enum EditorUISelfTest {
             await refreshDisplayedLayout()
             previewItem = model.player.currentItem
             guard let sampledHandle = model.framingState?.handles.first(where: { handle in
-                handle.time > legacyZoom.start && handle.time < legacyZoom.end &&
-                    !legacyZoom.cameraControlPoints.contains(where: { abs($0.time - handle.time) < 0.000001 })
-            }) else { throw failure("Legacy fixture did not expose a non-camera-control path sample.") }
+                handle.time > legacyZoom.start && handle.time < legacyZoom.end && legacyZoom.scale(at: handle.time) > 1.000001
+            }), let sampledControl = legacyZoom.cameraControlPoints.first(where: {
+                abs($0.time - sampledHandle.time) < 0.000001
+            }) else { throw failure("The automatic fixture did not expose an interior camera control.") }
             try await click(try cameraHandleIdentifier(at: sampledHandle.time))
             try require(model.editingSelectionTarget == .cameraAnchors &&
-                        abs((model.selectedMotionPointTime ?? -.infinity) - sampledHandle.time) < 0.000001 && model.canDeleteSelection,
-                        "Clicking a sampled legacy path point did not focus the selected movement time.")
+                        model.selectedCameraAnchorIDs == [sampledControl.id] && model.canDeleteSelection,
+                        "Clicking an automatic path point did not focus its corresponding camera control.")
             try await deleteKey()
             guard let afterSampleDelete = model.selectedZoom else { throw failure("Delete removed a legacy sample's containing zoom.") }
             try require(model.clips.count == 1 && model.totalDuration == duration &&
-                        afterSampleDelete.cameraKeyframes == nil && afterSampleDelete.cameraControlPoints == legacyZoom.cameraControlPoints &&
-                        afterSampleDelete.centerPath == legacyPath.filter { abs($0.time - sampledHandle.time) > 0.000001 },
-                        "Deleting a sampled legacy path point changed camera scale controls, other samples, duration or clip count.")
+                        afterSampleDelete.cameraControlPoints == legacyZoom.cameraControlPoints.filter { $0.id != sampledControl.id } &&
+                        afterSampleDelete.centerPath == legacyPath,
+                        "Deleting an automatic camera control changed retained source samples, duration, clip count or unrelated controls.")
             let savedSampleDelete = try persistedClips()
             try require(savedSampleDelete == model.clips && model.player.currentItem === previewItem,
                         "Deleting a sampled movement point failed to save or reloaded raw video.")
             try await undo()
             try require(model.clips == [legacyClip], "One Undo did not restore the exact legacy movement samples.")
-            record("delete-sampled-legacy-motion-point", began,
-                   "A native click and Delete on a legacy path sample removed only its selected time, retaining the legacy four scale controls and all other movement samples; one Undo restored it.")
+            record("delete-automatic-camera-control-keeps-source-path", began,
+                   "A native path-badge click and Delete removed only its matching camera control while retaining every original automatic center sample; one Undo restored the exact data.")
 
             began = Date()
             var twoClips = original
