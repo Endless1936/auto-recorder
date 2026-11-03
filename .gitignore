@@ -1,0 +1,45 @@
+# macOS and editor state
+.DS_Store
+._*
+*.xcuserstate
+xcuserdata/
+.vscode/
+.idea/
+
+# Generated apps, release assets and local QA evidence
+/dist/
+/.build/
+/.build-*/
+/.oil-ui/
+/.test-output/
+/Tests/release-*.json
+/Tests/validation.json
+*.log
+*.dmg
+*.zip
+*.tar.gz
+*.app/
+
+# Private recordings and editable projects
+*.mov
+*.mp4
+*.m4v
+*.wav
+*.m4a
+*.cursor.json
+project.json
+project.before-*.json
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+*.pem
+*.cer
+*.keychain
+*.keychain-db
+*.mobileprovision
+AuthKey_*.p8

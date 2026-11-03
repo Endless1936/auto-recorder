@@ -1,0 +1,289 @@
+import AVFoundation
+import CoreMedia
+import CoreVideo
+
+@MainActor
+enum AutoZoomSelfTest {
+    static let trace = CursorTrace(samples: [
+        CursorSample(time: 0, x: 0.5, y: 0.5, inside: true, clicked: false),
+        CursorSample(time: 0.5, x: 0.25, y: 0.25, inside: true, clicked: true),
+        CursorSample(time: 1.5, x: 0.95, y: 0.9, inside: true, clicked: false),
+        CursorSample(time: 2, x: 0.98, y: 0.95, inside: true, clicked: true)
+    ])
+
+    static func checkPlan() throws {
+        let normalized = CursorTrace.normalized(CGPoint(x: -1720, y: -150),
+            in: CGRect(x: -1920, y: -300, width: 800, height: 600))
+        try check(abs(normalized.x - 0.25) < 0.0001 && abs(normalized.y - 0.25) < 0.0001,
+                  "有偏移的屏幕/选区坐标错误")
+        let aligned = CursorTrace.aligned([
+            CursorSample(time: 999.9, x: 0, y: 0, inside: true, clicked: true),
+            CursorSample(time: 1000.75, x: 0.2, y: 0.3, inside: true, clicked: true)
+        ], origin: 1000.5)
+        try check(aligned.samples.count == 1 && abs(aligned.samples[0].time - 0.25) < 0.000001,
+                  "鼠标时间未对齐原片 startSession")
+        let plan = AutoZoomPlan(trace: trace, duration: 7, fps: 30)
+        try check(plan.pose(at: 0.2).scale == 1 && plan.pose(at: 1.2).scale > 1.58 && plan.pose(at: 6.8).scale < 1.001,
+                  "点击放大或空闲恢复错误")
+        for pose in plan.poses {
+            let viewport = pose.viewport
+            try check(viewport.minX >= -0.00001 && viewport.minY >= -0.00001 &&
+                      viewport.maxX <= 1.00001 && viewport.maxY <= 1.00001, "镜头超出图像产生黑边")
+        }
+        let outside = AutoZoomPlan(trace: CursorTrace(samples: trace.samples + [
+            CursorSample(time: 2.2, x: 2, y: 0.5, inside: false, clicked: true)
+        ]), duration: 7, fps: 60)
+        try check(outside.pose(at: 3.2).scale < 1.002, "离开区域后未恢复全景")
+        let idle = AutoZoomPlan(trace: CursorTrace(samples: [
+            CursorSample(time: 1, x: 0.8, y: 0.8, inside: true, clicked: false)
+        ]), duration: 4, fps: 30)
+        try check(idle.poses.allSatisfy { $0.scale == 1 }, "无点击时意外放大")
+        // Every step is below the activity threshold, but the pointer keeps moving.
+        let slowSamples = (0...300).map { (i: Int) -> CursorSample in
+            CursorSample(time: Double(i) / 60, x: 0.2 + Double(i) * 0.001,
+                         y: 0.5, inside: true, clicked: i == 15)
+        }
+        let jitterSamples = (0...300).map { (i: Int) -> CursorSample in
+            let offset: Double = i % 2 == 0 ? 0.0004 : -0.0004
+            return CursorSample(time: Double(i) / 60, x: 0.5 + offset,
+                                y: 0.5, inside: true, clicked: i == 15)
+        }
+        for fps in [30, 60] {
+            let pause = AutoZoomPlan(trace: CursorTrace(samples: [
+                CursorSample(time: 0.5, x: 0.3, y: 0.5, inside: true, clicked: true)
+            ]), duration: 3, fps: fps)
+            try check(pause.pose(at: 1.4).scale > 1.59 && pause.pose(at: 1.75).scale < 1.15 &&
+                      pause.pose(at: 2.5).scale < 1.001, "应在停顿 1 秒后开始平滑恢复全景")
+            let slow = AutoZoomPlan(trace: CursorTrace(samples: slowSamples), duration: 8.5, fps: fps)
+            try check(slow.pose(at: 4).scale > 1.59, "慢速持续移动被误判为空闲")
+            try check(slow.pose(at: 8.2).scale < 1.001, "慢速移动停止后未恢复全景")
+            let jitter = AutoZoomPlan(trace: CursorTrace(samples: jitterSamples), duration: 5, fps: fps)
+            try check(jitter.pose(at: 2.5).scale < 1.001, "微小往返抖动意外延长放大")
+            let reentry = AutoZoomPlan(trace: CursorTrace(samples: [
+                CursorSample(time: 0, x: 0.3, y: 0.5, inside: true, clicked: true),
+                CursorSample(time: 1, x: 1.1, y: 0.5, inside: false, clicked: false),
+                CursorSample(time: 1.5, x: 0.5, y: 0.5, inside: true, clicked: false),
+                CursorSample(time: 2, x: 0.7, y: 0.5, inside: true, clicked: false),
+                CursorSample(time: 3.5, x: 0.7, y: 0.5, inside: true, clicked: true)
+            ]), duration: 5, fps: fps)
+            try check(reentry.pose(at: 3).scale < 1.001 && reentry.pose(at: 4.5).scale > 1.59,
+                      "离区重返需点击才能再次放大")
+        }
+        let saved = try JSONEncoder().encode(trace)
+        try check(try JSONDecoder().decode(CursorTrace.self, from: saved).samples.count == trace.samples.count,
+                  "轨迹保存错误")
+        print("PASS zoom plan: offset coordinates, host time alignment, clicks, 1-second idle/outside restore, bounded crop, no-click, slow movement, jitter, reentry, 30/60fps, JSON")
+    }
+
+    static func run(directory: URL) async throws {
+        try checkPlan()
+        let size = CGSize(width: 1920, height: 1080)
+        let low = AutoZoomExporter.targetBitrate(size: size, fps: 60, sourceRate: 20_000)
+        let high = AutoZoomExporter.targetBitrate(size: size, fps: 60, sourceRate: 200_000_000)
+        try check(low >= 4_900_000 && high <= 10_000_000 && low < high,
+                  "效果码率应兼顾静态原片清晰度下限与高码率上限")
+        try check(AutoZoomExporter.targetBitrate(size: size, fps: 60, sourceRate: .nan) == low,
+                  "缺失原片码率时未使用合理下限")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for quality in RecordingQuality.allCases {
+            let label = quality == .hevc ? "hevc" : "prores"
+            let raw = directory.appendingPathComponent(label + "-original.mov")
+            try await fixture(to: raw, quality: quality)
+            let originalData = try Data(contentsOf: raw)
+            let output = directory.appendingPathComponent(label + "-zoom.mov")
+            let exporter = AutoZoomExporter()
+            try await exporter.export(source: raw, destination: output, trace: trace,
+                                      fps: 30, quality: quality) { _ in }
+            try await validate(original: raw, output: output)
+            try check(try Data(contentsOf: raw) == originalData, "导出修改了原片")
+            let noClick = directory.appendingPathComponent(label + "-no-click.mov")
+            try await exporter.export(source: raw, destination: noClick, trace: CursorTrace(samples: []),
+                                      fps: 30, quality: quality) { _ in }
+            try check(try Data(contentsOf: noClick) == originalData, "无点击视频被重复编码")
+            print("PASS \(label) zoom: static source -> 30fps animated export, audio/duration, native size, original intact, no-click copy")
+        }
+        let source = directory.appendingPathComponent("hevc-original.mov")
+        let silent = directory.appendingPathComponent("silent-original.mov")
+        let silentEffect = directory.appendingPathComponent("silent-zoom.mov")
+        try await fixture(to: silent, quality: .hevc, withAudio: false)
+        try await AutoZoomExporter().export(source: silent, destination: silentEffect, trace: trace,
+                                          fps: 30, quality: .hevc) { _ in }
+        let silentTracks = try await AVURLAsset(url: silentEffect).loadTracks(withMediaType: .audio)
+        try check(silentTracks.isEmpty, "关闭声音后效果视频出现音轨")
+        print("PASS zoom without audio: video-only capture remains video-only")
+        let delayedAudio = directory.appendingPathComponent("delayed-audio-original.mov")
+        let delayedEffect = directory.appendingPathComponent("delayed-audio-zoom.mov")
+        try await fixture(to: delayedAudio, quality: .hevc, withAudioGap: true)
+        try await AutoZoomExporter().export(source: delayedAudio, destination: delayedEffect,
+            trace: trace, fps: 30, quality: .hevc) { _ in }
+        let delayedSource = try await encodedAudio(AVURLAsset(url: delayedAudio))
+        let delayedOutput = try await encodedAudio(AVURLAsset(url: delayedEffect))
+        try check(delayedSource.data == delayedOutput.data &&
+                  abs(delayedSource.firstPTS - delayedOutput.firstPTS) < 0.001 &&
+                  abs(delayedSource.endPTS - delayedOutput.endPTS) < 0.001,
+                  "延迟音频与中间静音的原始音频包或时间戳发生变化")
+        print("PASS delayed audio and silence gap: packet bytes and first/end timestamps preserved")
+        let duringExport = AutoZoomExporter()
+        var reachedEncoding = false
+        var cancelledDuringEncoding = false
+        do {
+            try await duringExport.export(source: source,
+                destination: directory.appendingPathComponent("cancelled-during-encoding.mov"),
+                trace: trace, fps: 30, quality: .hevc) { value in
+                    if value >= 0.1 { reachedEncoding = true; duringExport.cancel() }
+                }
+        } catch is CancellationError { cancelledDuringEncoding = true }
+        try check(reachedEncoding && cancelledDuringEncoding && FileManager.default.fileExists(atPath: source.path),
+                  "编码期间取消未生效或原片丢失")
+        print("PASS HEVC encoding cancellation after progress; source preserved")
+        let cancelled = directory.appendingPathComponent("cancelled.mov")
+        let exporter = AutoZoomExporter()
+        let task = Task { try await exporter.export(source: source, destination: cancelled, trace: trace,
+                                                   fps: 30, quality: .hevc) { _ in } }
+        await Task.yield()
+        exporter.cancel()
+        var didCancel = false
+        do { try await task.value }
+        catch { didCancel = true }
+        try check(didCancel && exporter.cancelled, "取消后仍完成导出")
+        try check(FileManager.default.fileExists(atPath: source.path), "取消处理丢失原片")
+        print("PASS zoom cancellation: original preserved")
+        let failing = AutoZoomExporter()
+        var didFail = false
+        do {
+            try await failing.export(source: source, destination: directory.appendingPathComponent("missing/output.mov"),
+                                     trace: trace, fps: 30, quality: .hevc) { _ in }
+        } catch { didFail = true }
+        try check(didFail && FileManager.default.fileExists(atPath: source.path), "失败导出丢失原片")
+        print("PASS zoom export failure: original preserved")
+    }
+
+    private static func fixture(to url: URL, quality: RecordingQuality, withAudio: Bool = true,
+                                withAudioGap: Bool = false) async throws {
+        let width = 640, height = 360
+        var pixel: CVPixelBuffer?
+        try check(CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &pixel) == kCVReturnSuccess,
+                  "测试图像分配失败")
+        guard let pixel else { throw RecorderError.message("测试像素为空") }
+        CVPixelBufferLockBaseAddress(pixel, [])
+        let bytes = CVPixelBufferGetBaseAddress(pixel)!.assumingMemoryBound(to: UInt8.self)
+        let row = CVPixelBufferGetBytesPerRow(pixel)
+        for y in 0..<height { for x in 0..<width {
+            let i = y * row + x * 4
+            bytes[i] = UInt8(40 + y * 160 / height)
+            bytes[i + 1] = 120
+            bytes[i + 2] = UInt8(40 + x * 160 / width)
+            bytes[i + 3] = 255
+        } }
+        CVPixelBufferUnlockBaseAddress(pixel, [])
+        var description: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixel,
+                                                    formatDescriptionOut: &description)
+        guard let description else { throw RecorderError.message("测试视频格式失败") }
+        func sample(at time: Double) throws -> CMSampleBuffer {
+            var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30),
+                presentationTimeStamp: CMTime(seconds: 1000.5 + time, preferredTimescale: 60_000), decodeTimeStamp: .invalid)
+            var result: CMSampleBuffer?
+            let status = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixel,
+                formatDescription: description, sampleTiming: &timing, sampleBufferOut: &result)
+            guard status == noErr, let result else { throw RecorderError.message("测试视频样本失败") }
+            return result
+        }
+        let writer = try RecordingWriter(url: url, width: width, height: height, fps: 30, quality: quality,
+                                         audioOptions: .init(systemAudio: withAudio, microphone: false))
+        let first = try sample(at: 0)
+        writer.queue.sync { writer.appendVideo(first) }
+        // Only two static source video frames; the effect must animate between them.
+        for tick in 0..<(withAudio ? 350 : 0) {
+            // The real capture writer must retain one second of initial silence
+            // and the two-second gap, even when capture delivers no audio there.
+            if withAudioGap && (tick < 50 || (100..<200).contains(tick)) { continue }
+            let values = (0..<960).flatMap { index -> [Float] in
+                let value = Float(sin(2 * Double.pi * 440 * Double(tick * 960 + index) / 48_000) * 0.1)
+                return [value, value]
+            }
+            let audio = try AudioMixer.sample(values, pts: CMTime(seconds: 1000.5 + Double(tick) * 0.02, preferredTimescale: 48_000))
+            writer.queue.sync { writer.appendAudio(audio) }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        if !withAudio { try await Task.sleep(nanoseconds: 100_000_000) }
+        let last = try sample(at: 7)
+        writer.queue.sync { writer.appendVideo(last) }
+        let stats = try await writer.finish(extendToNow: false)
+        try check(stats.videoFrames == 2, "静态测试视频并非两帧")
+    }
+
+    private static func validate(original: URL, output: URL) async throws {
+        let source = AVURLAsset(url: original), asset = AVURLAsset(url: output)
+        let sourceDuration = try await source.load(.duration)
+        let duration = try await asset.load(.duration)
+        try check(abs(sourceDuration.seconds - duration.seconds) < 0.05, "效果视频时长改变")
+        let audio = try await asset.loadTracks(withMediaType: .audio)
+        try check(audio.count == 1, "效果视频音轨丢失")
+        guard let video = try await asset.loadTracks(withMediaType: .video).first else {
+            throw RecorderError.message("效果视频缺少画面")
+        }
+        try check(try await video.load(.naturalSize) == CGSize(width: 640, height: 360), "导出缩小了分辨率")
+        let reader = try AVAssetReader(asset: asset)
+        let frames = AVAssetReaderTrackOutput(track: video, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        reader.add(frames)
+        try check(reader.startReading(), "效果视频无法解码")
+        var count = 0, first: [Int] = [], zoom: [Int] = [], restored: [Int] = []
+        while let sample = frames.copyNextSampleBuffer() {
+            count += 1
+            let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+            if let pixel = CMSampleBufferGetImageBuffer(sample) {
+                CVPixelBufferLockBaseAddress(pixel, .readOnly)
+                let bytes = CVPixelBufferGetBaseAddress(pixel)!.assumingMemoryBound(to: UInt8.self)
+                let row = CVPixelBufferGetBytesPerRow(pixel)
+                let i = CVPixelBufferGetHeight(pixel) / 2 * row + CVPixelBufferGetWidth(pixel) / 2 * 4
+                let color = [Int(bytes[i]), Int(bytes[i + 2])]
+                if time > 0.1 && time < 0.2 { first = color }
+                if time > 1.1 && time < 1.3 { zoom = color }
+                if time > 6.7 { restored = color }
+                CVPixelBufferUnlockBaseAddress(pixel, .readOnly)
+            }
+        }
+        try check(reader.status == .completed && count >= 209, "静止原片未持续生成动画帧")
+        try check(first.count == 2 && zoom.count == 2 && restored.count == 2, "效果取样帧丢失")
+        try check(abs(first[0] - zoom[0]) + abs(first[1] - zoom[1]) > 35, "静止画面上的镜头未放大移动")
+        try check(abs(first[0] - restored[0]) + abs(first[1] - restored[1]) < 12, "空闲后未恢复全景")
+        if try await video.load(.formatDescriptions).first.map({ CMFormatDescriptionGetMediaSubType($0) }) == kCMVideoCodecType_HEVC {
+            let a = try await encodedAudio(source), b = try await encodedAudio(asset)
+            try check(a.data == b.data && abs(a.firstPTS - b.firstPTS) < 0.001,
+                      "HEVC效果导出不应重编码音轨或改变音频起点")
+        }
+    }
+
+    private static func encodedAudio(_ asset: AVAsset) async throws -> (data: Data, firstPTS: Double, endPTS: Double) {
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let track = tracks.first else { throw RecorderError.message("测试音轨为空") }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        try check(reader.startReading(), "无法读取测试音频包")
+        var data = Data(), firstPTS: Double?, endPTS = 0.0
+        while let sample = output.copyNextSampleBuffer() {
+            if let block = CMSampleBufferGetDataBuffer(sample) {
+                let count = CMBlockBufferGetDataLength(block)
+                guard count > 0 else { continue }
+                // Empty edit/gap markers are timeline metadata, not audio packets.
+                if firstPTS == nil { firstPTS = CMSampleBufferGetPresentationTimeStamp(sample).seconds }
+                // Reader buffers can group a different number of AAC packets.
+                // Compare the end of the last group, not its starting timestamp.
+                endPTS = (CMSampleBufferGetPresentationTimeStamp(sample) + CMSampleBufferGetDuration(sample)).seconds
+                var bytes = [UInt8](repeating: 0, count: count)
+                let status = CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: count, destination: &bytes)
+                try check(status == noErr, "无法复制测试音频包")
+                data.append(contentsOf: bytes)
+            }
+        }
+        try check(reader.status == .completed && firstPTS != nil, "测试音轨未完整读取")
+        return (data, firstPTS ?? 0, endPTS)
+    }
+
+    private static func check(_ condition: Bool, _ message: String) throws {
+        if !condition { throw RecorderError.message(message) }
+    }
+}

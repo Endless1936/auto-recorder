@@ -1,0 +1,30 @@
+name: macOS build and tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check runner architecture
+        run: test "$(uname -m)" = arm64
+      - name: Build development app
+        env:
+          CODE_SIGN_IDENTITY: "-"
+        run: bash build.sh "$RUNNER_TEMP/build"
+      - name: Run synthetic regression tests
+        shell: bash
+        run: |
+          APP="$RUNNER_TEMP/build/Auto Recorder.app/Contents/MacOS/AutoRecorder"
+          "$APP" --geometry-test
+          "$APP" --permission-test
+          "$APP" --project-test "$(mktemp -d "$RUNNER_TEMP/project-tests.XXXXXX")"
+          "$APP" --pause-test "$(mktemp -d "$RUNNER_TEMP/pause-tests.XXXXXX")"
