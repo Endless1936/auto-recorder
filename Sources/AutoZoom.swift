@@ -114,10 +114,17 @@ struct ZoomPose: Sendable {
     }
 }
 
+struct ZoomReturn: Sendable {
+    var time: Double
+    var end: Double = .infinity
+    var pose: ZoomPose
+}
+
 /// A precomputed path makes random-access export requests deterministic.
 struct AutoZoomPlan: Sendable {
     let fps: Int
     let poses: [ZoomPose]
+    let returns: [ZoomReturn]
 
     init(trace: CursorTrace, duration: Double, fps: Int) {
         self.fps = max(1, min(60, fps))
@@ -133,6 +140,8 @@ struct AutoZoomPlan: Sendable {
         var activityPointer: CursorSample?
         var lastActivity = -Double.infinity
         var active = false
+        var returnOrigin: ZoomPose?
+        var returnSpans: [ZoomReturn] = []
         var index = 0
         var result: [ZoomPose] = []
         result.reserveCapacity(Int(ceil(duration * Double(self.fps))) + 2)
@@ -168,16 +177,33 @@ struct AutoZoomPlan: Sendable {
                 }
                 targetX = min(1 - margin, max(margin, targetX))
                 targetY = min(1 - margin, max(margin, targetY))
-            } else { targetX = 0.5; targetY = 0.5 }
+            }
+            if active {
+                if returnOrigin != nil, returnSpans.last?.end == Double.infinity { returnSpans[returnSpans.count - 1].end = time - step }
+                returnOrigin = nil
+            } else if returnOrigin == nil {
+                returnOrigin = pose
+                if pose.scale > 1.005 {
+                    returnSpans.append(ZoomReturn(time: max(0, time - step), pose: pose))
+                }
+            }
             pose.scale += (scale - pose.scale) * alpha
-            pose.x += (targetX - pose.x) * alpha
-            pose.y += (targetY - pose.y) * alpha
+            if let origin = returnOrigin, origin.scale > 1.000000001 {
+                let radius = 0.5 / origin.scale
+                let amount = min(1, max(0, (0.5 / pose.scale - radius) / (0.5 - radius)))
+                pose.x = origin.x + (0.5 - origin.x) * amount
+                pose.y = origin.y + (0.5 - origin.y) * amount
+            } else {
+                pose.x += (targetX - pose.x) * alpha
+                pose.y += (targetY - pose.y) * alpha
+            }
             let margin = 0.5 / pose.scale
             pose.x = min(1 - margin, max(margin, pose.x))
             pose.y = min(1 - margin, max(margin, pose.y))
             result.append(pose)
         }
         poses = result
+        returns = returnSpans
     }
 
     func pose(at time: Double) -> ZoomPose {

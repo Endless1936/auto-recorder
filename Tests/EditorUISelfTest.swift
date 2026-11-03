@@ -60,6 +60,19 @@ enum EditorUISelfTest {
             if model.isPlaying { try await click("editor.preview.play") }
             try require(!model.isPlaying, "Unable to pause playback through the preview control.")
             let original = model.clips
+            let menuBegan = Date()
+            let menuOwner = AppDelegate()
+            for state in [(false, false), (true, false), (true, true)] {
+                let menu = menuOwner.statusMenu(recording: state.0, paused: state.1)
+                let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+                let expected = state.0
+                    ? [state.1 ? "继续录制" : "暂停录制", "停止并编辑", "录制面板", "退出Auto Recorder"]
+                    : ["录制面板", "退出Auto Recorder"]
+                try require(titles == expected && menu.items.filter { !$0.isSeparatorItem }.allSatisfy { $0.action != nil && $0.target != nil },
+                            "The status menu retains project-opening entries or lost recording controls.")
+            }
+            record("status-menu-recording-controls-only", menuBegan,
+                   "Actual idle, recording and paused menu construction contains the panel/quit and relevant recording controls, with no Open Project or Recent Project entries.")
             try require(!model.showsFramingOverlay && model.previewCameraEffectsEnabled,
                         "A newly opened editor must default to processed preview with framing assistance off.")
             try screenshot("initial")

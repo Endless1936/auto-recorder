@@ -71,6 +71,7 @@ enum AutoZoomSelfTest {
             try checkSafeZone(fps: fps)
         }
         try checkRecordedMotion()
+        try checkDirectReturn()
         let saved = try JSONEncoder().encode(trace)
         try check(try JSONDecoder().decode(CursorTrace.self, from: saved).samples.count == trace.samples.count,
                   "轨迹保存错误")
@@ -124,6 +125,9 @@ enum AutoZoomSelfTest {
                     fall: extends ? max(Double(fall) * step, duration) : Double(fall) * step,
                     end: extends ? duration + 0.5 : min(duration, Double(last + 1) * step), peak: peak)
                 let ramp = 0.05, hold = 0.001, tolerance = 0.000000001
+                if extends, let transition = plan.returns.last(where: { $0.time >= value.start && $0.time <= Double(last) * step && $0.end >= Double(last) * step }) {
+                    value.fall = min(value.fall, max(value.rise + hold, transition.time))
+                }
                 if value.end - value.start < ramp + hold + ramp - tolerance { value.end = value.start + ramp + hold + ramp }
                 if value.rise - value.start < ramp - tolerance { value.rise = value.start + ramp }
                 if value.end - value.rise < ramp + hold - tolerance { value.rise = value.end - ramp - hold }
@@ -280,8 +284,14 @@ enum AutoZoomSelfTest {
                         let time = zoom.start + (zoom.end - zoom.start) * Double(index) / Double(count)
                         let scale = envelope.scale(at: time), margin = 0.5 / scale
                         let sample = reference.pose(at: min(last.time, max(first.time, time)))
-                        let x = min(1 - margin, max(margin, sample.x))
-                        let y = min(1 - margin, max(margin, sample.y))
+                        var x = min(1 - margin, max(margin, sample.x))
+                        var y = min(1 - margin, max(margin, sample.y))
+                        if let origin = zoom.returnOrigin, time >= origin.time {
+                            let width = 1 / envelope.scale(at: envelope.fall)
+                            let progress = time > envelope.fall ? min(1, max(0, (1 / scale - width) / (1 - width))) : 0
+                            x = origin.x * (1 - progress) + 0.5 * progress
+                            y = origin.y * (1 - progress) + 0.5 * progress
+                        }
                         for value in [zoom, reopened] {
                             let actual = value.pose(at: time)
                             largestScaleError = max(largestScaleError, abs(actual.scale - scale))
@@ -300,6 +310,50 @@ enum AutoZoomSelfTest {
             }
         }
         print("PASS faithful motion: complete original frame-by-frame centers, no trajectory fitting, historical zoom phases/scales, nondestructive anchor insertion, JSON identity, circles/irregular/wide/edge paths and 30/60fps")
+    }
+
+    private static func checkDirectReturn() throws {
+        for fps in [30, 60] {
+            for location in [(0.05, 0.05), (0.95, 0.05), (0.05, 0.95), (0.95, 0.95)] {
+                let trace = CursorTrace(samples: [CursorSample(time: 0.5, x: location.0, y: location.1, inside: true, clicked: true)])
+                let plan = AutoZoomPlan(trace: trace, duration: 4, fps: fps)
+                guard let transition = plan.returns.first else { throw RecorderError.message("停顿后缺少回全景起点") }
+                let initial = transition.pose.viewport
+                for index in plan.poses.indices where Double(index) / Double(fps) >= transition.time {
+                    let pose = plan.poses[index], rect = pose.viewport
+                    let amount = (rect.width - initial.width) / (1 - initial.width)
+                    try check(abs(rect.minX - initial.minX * (1 - amount)) < 1e-8 &&
+                              abs(rect.minY - initial.minY * (1 - amount)) < 1e-8 &&
+                              abs(rect.maxX - (initial.maxX + (1 - initial.maxX) * amount)) < 1e-8 &&
+                              abs(rect.maxY - (initial.maxY + (1 - initial.maxY) * amount)) < 1e-8,
+                              "基础运镜先平移居中，未从当前取景框直接展开")
+                }
+                let zoom = ProjectStore.automaticZooms(trace: trace, duration: 4, fps: Int32(fps))[0]
+                let stopped = ProjectStore.automaticZooms(trace: trace, duration: 1.65, fps: Int32(fps))[0]
+                try check(stopped.fallStart < 1.55 && stopped.scale(at: 1.6) < stopped.peak - 0.01,
+                          "片尾截在回全景过程中时，缩放被错误推迟到录制结束后")
+                let start = zoom.pose(at: transition.time)
+                let initialLeft = start.x - 0.5 / start.scale, initialTop = start.y - 0.5 / start.scale
+                var inserted = zoom
+                _ = inserted.addCameraKeyframe(at: zoom.fallStart + (zoom.end - zoom.fallStart) * 0.4)
+                inserted = inserted.normalized()
+                let reopened = try JSONDecoder().decode(ZoomSegment.self, from: JSONEncoder().encode(inserted))
+                let cut = reopened.shifted(by: -1.2).normalized()
+                for i in 0...720 {
+                    let time = transition.time + (zoom.end - transition.time) * Double(i) / 720
+                    let pose = zoom.pose(at: time), amount = (1 / pose.scale - 1 / start.scale) / (1 - 1 / start.scale)
+                    try check(abs(pose.x - 0.5 / pose.scale - initialLeft * (1 - amount)) < 1e-8 &&
+                              abs(pose.y - 0.5 / pose.scale - initialTop * (1 - amount)) < 1e-8,
+                              "编辑器的回全景位置和缩放不同步")
+                    for (value, offset) in [(reopened, 0.0), (cut, -1.2)] {
+                        let actual = value.pose(at: time + offset)
+                        try check(abs(actual.x - pose.x) < 1e-8 && abs(actual.y - pose.y) < 1e-8 && abs(actual.scale - pose.scale) < 1e-8,
+                                  "无修改加点、保存或剪切破坏了直接回全景")
+                    }
+                }
+            }
+        }
+        print("PASS direct full-view return: four off-center crops expand directly, synchronized position/size at 30/60fps, editor parity, exact insertion, JSON and shifted cuts")
     }
 
     private static func checkSafeZone(fps: Int) throws {
@@ -337,7 +391,7 @@ enum AutoZoomSelfTest {
                     let pose = plan.poses[index]
                     let actual = horizontal ? pose.x : pose.y
                     let otherAxis = horizontal ? pose.y : pose.x
-                    try check(abs(actual - expected) < 0.000000001 && abs(otherAxis - 0.5) < 0.000000001,
+                    try check(index > fps * 3 || (abs(actual - expected) < 0.000000001 && abs(otherAxis - 0.5) < 0.000000001),
                               "\(label)：越过70%安全区后的平移、反向安全区或原有平滑速度不正确")
                 }
                 let firstPan = plan.poses[fps]

@@ -68,6 +68,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     var centerOffsets: [CameraCenterOffset]?
     var centerPanSpans: [CameraPanSpan]?
     var localCenterEdits: [CameraLocalOffset]? = nil
+    var returnOrigin: ZoomCenterPoint? = nil
     // Retained only to reopen authored projects from earlier camera planners.
     var simpleMotion: Bool?
     var positionMotion: Bool?
@@ -115,7 +116,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             let candidates = sortedMotionTimes(pathTimes + originalTimes).filter { $0 >= start && $0 <= end }
             let samples = candidates.map { time -> CameraMotionSample in
                 let value = scale(at: time), margin = 0.5 / value
-                let center = interpolatedCenter(in: centerPath, at: time)
+                let center = automaticCenter(at: time)
                 return CameraMotionSample(time: time, x: min(1 - margin, max(margin, center.0)),
                     y: min(1 - margin, max(margin, center.1)), scale: value, scaleSlope: scaleDerivative(at: time))
             }
@@ -250,7 +251,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
                 centerOffsets = (original.centerOffsets ?? []).filter { !isMovedTime($0.time) }
                 for point in moving {
                     let center = baseMotion.pose(at: point.time), offset = original.centerOffset(at: point.time)
-                    let base = interpolatedCenter(in: centerPath, at: point.time + timeDelta)
+                    let base = automaticCenter(at: point.time + timeDelta)
                     storeCenterOffset(CameraCenterOffset(time: point.time + timeDelta, x: center.x - base.0,
                         y: center.y - base.1, slopeX: offset.slopeX, slopeY: offset.slopeY))
                 }
@@ -283,7 +284,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         moveCenterPanEndpoints(from: oldTime, to: newTime, x: value.x, y: value.y)
         if !manualFocus, !centerPath.isEmpty {
             let offset = centerOffset(at: oldTime)
-            let base = interpolatedCenter(in: centerPath, at: newTime)
+            let base = automaticCenter(at: newTime)
             centerOffsets?.removeAll { abs($0.time - oldTime) < 0.000001 || abs($0.time - newTime) < 0.000001 }
             storeCenterOffset(CameraCenterOffset(time: newTime, x: value.x - base.0, y: value.y - base.1,
                 slopeX: offset.slopeX, slopeY: offset.slopeY))
@@ -419,6 +420,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         result.centerOffsets = centerOffsets?.map { var point = $0; point.time += offset; return point }
         result.centerPanSpans = centerPanSpans?.map { var span = $0; span.start += offset; span.end += offset; return span }
         result.localCenterEdits = localCenterEdits?.map { $0.shifted(by: offset) }
+        if var origin = result.returnOrigin { origin.time += offset; result.returnOrigin = origin }
         return result
     }
 
@@ -472,6 +474,18 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         return delta * 6 * t * (1 - t) / (b - a)
     }
 
+    private func automaticCenter(at time: Double) -> (Double, Double) {
+        guard let origin = returnOrigin, time >= origin.time else {
+            return interpolatedCenter(in: centerPath, at: time)
+        }
+        // Keep the crop in place until the editor's scale ramp begins, then
+        // expand its four edges toward the full image with one shared progress.
+        let radius = 0.5 / scale(at: fallStart)
+        let amount = radius < 0.5 - 1e-9 && time > fallStart
+            ? min(1, max(0, (0.5 / scale(at: time) - radius) / (0.5 - radius))) : 0
+        return (origin.x + (0.5 - origin.x) * amount, origin.y + (0.5 - origin.y) * amount)
+    }
+
     private func unclampedCenter(at time: Double) -> (Double, Double) {
         let scale = self.scale(at: time)
         var center: (Double, Double)
@@ -481,7 +495,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             let amount = peak > 1 ? (scale - 1) / (peak - 1) : 0
             center = (0.5 + (focusX - 0.5) * amount, 0.5 + (focusY - 0.5) * amount)
         } else {
-            let base = interpolatedCenter(in: centerPath, at: time)
+            let base = automaticCenter(at: time)
             if let offsets = centerOffsets, !offsets.isEmpty {
                 let correction = centerOffset(at: time)
                 center = (base.0 + correction.x, base.1 + correction.y)
@@ -554,7 +568,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         if !manualFocus, !centerPath.isEmpty {
             guard let anchor = addCameraKeyframe(at: time) else { return }
             let margin = 0.5 / scale(at: anchor.time)
-            let base = interpolatedCenter(in: centerPath, at: anchor.time)
+            let base = automaticCenter(at: anchor.time)
             let previous = centerOffset(at: anchor.time)
             let centerX = min(1 - margin, max(margin, x)), centerY = min(1 - margin, max(margin, y))
             storeCenterOffset(CameraCenterOffset(time: anchor.time, x: centerX - base.0,
@@ -686,7 +700,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
                 result.peak = points.map(\.scale).max() ?? 1
                 result.riseEnd = result.start + (result.end - result.start) / 3
                 result.fallStart = result.start + (result.end - result.start) * 2 / 3
-                if result.positionMotion == true, originalRise > result.start,
+                if (result.positionMotion == true || result.returnOrigin != nil), originalRise > result.start,
                    originalFall > originalRise, originalFall < result.end {
                     result.riseEnd = originalRise
                     result.fallStart = originalFall
@@ -979,9 +993,17 @@ enum ProjectStore {
             let path = (max(0, first - 1)...min(plan.poses.count - 1, last + 1)).map {
                 ZoomCenterPoint(time: Double($0) * step, x: plan.poses[$0].x, y: plan.poses[$0].y)
             }
-            return ZoomSegment(start: start, riseEnd: Double(rise) * step, fallStart: fallTime,
+            var zoom = ZoomSegment(start: start, riseEnd: Double(rise) * step, fallStart: fallTime,
                 end: end, peak: peak, focusX: plan.poses[rise].x, focusY: plan.poses[rise].y,
                 centerPath: path).normalized()
+            if let transition = plan.returns.last(where: { $0.time >= start && $0.time <= Double(last) * step && $0.end >= Double(last) * step }) {
+                zoom.returnOrigin = ZoomCenterPoint(time: transition.time, x: transition.pose.x, y: transition.pose.y)
+                // A recording can stop midway through the idle return. Keep its
+                // real onset instead of postponing zoom-out to the source end.
+                zoom.fallStart = min(zoom.fallStart, max(zoom.riseEnd + ZoomSegment.minimumHoldDuration, transition.time))
+                zoom = zoom.normalized()
+            }
+            return zoom
         }
     }
 }

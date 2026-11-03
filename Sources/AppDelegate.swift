@@ -400,18 +400,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         button.imagePosition = .imageLeading
         button.attributedTitle = NSAttributedString(string: active ? " \(appTime(recorder.elapsedDuration))" : "",
             attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)])
+        statusItem.menu = statusMenu(recording: active, paused: settings.paused)
+    }
+
+    func statusMenu(recording: Bool, paused: Bool) -> NSMenu {
         let menu = NSMenu(); menu.autoenablesItems = false
-        if active {
-            item(settings.paused ? "继续录制" : "暂停录制", #selector(togglePause), in: menu)
+        if recording {
+            item(paused ? "继续录制" : "暂停录制", #selector(togglePause), in: menu)
             item("停止并编辑", #selector(stopRecording), in: menu)
             menu.addItem(.separator())
         }
         item("录制面板", #selector(showWindow), in: menu)
-        item("打开工程…", #selector(openProject), in: menu)
-        if UserDefaults.standard.url(forKey: "lastProject") != nil { item("最近工程", #selector(openLastProject), in: menu) }
         menu.addItem(.separator())
         item("退出Auto Recorder", #selector(NSApplication.terminate(_:)), target: NSApp, in: menu)
-        statusItem.menu = menu
+        return menu
     }
     private func captureFailed(_ error: Error) {
         quitAfterSave = false
@@ -456,10 +458,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         panel.allowsMultipleSelection = false; panel.directoryURL = settings.directory
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task { await loadProject(url.hasDirectoryPath ? url : url.deletingLastPathComponent()) }
-    }
-    @objc private func openLastProject() {
-        guard let url = UserDefaults.standard.url(forKey: "lastProject") else { return }
-        Task { await loadProject(url) }
     }
     private func loadProject(_ folder: URL) async {
         guard recorder.state == .idle, !openingProject, editor?.isExporting != true else { return }
