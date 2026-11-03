@@ -23,7 +23,6 @@ IDENTITY="$(sed -n 's/^Authority=\(Developer ID Application:.*\)$/\1/p' <<< "$SI
 [[ -n "$IDENTITY" ]] || fail "Public packaging requires a Developer ID Application signature."
 grep -q '^Timestamp=' <<< "$SIGNATURE" || fail "Rebuild with BUILD_MODE=release to add a secure timestamp."
 grep -q 'flags=.*runtime' <<< "$SIGNATURE" || fail "Rebuild with hardened runtime enabled."
-TIMESTAMP="$(sed -n 's/^Timestamp=//p' <<< "$SIGNATURE")"
 
 for item in Sources Tests Assets scripts docs .github LICENSE Info.plist Entitlements.plist build.sh install.sh README.md README.en.md AGENTS.md CONTRIBUTING.md .gitignore .gitattributes; do
   [[ -e "$ROOT/$item" ]] || fail "Missing source-distribution input: $item"
@@ -54,7 +53,7 @@ cp "$ROOT/docs/INSTALL.txt" "$STAGE/dmg/Read Me.txt"
 hdiutil create -quiet -fs HFS+ -format UDZO -volname "Auto Recorder" -srcfolder "$STAGE/dmg" "$OUTPUT/$DMG_NAME"
 codesign --force --sign "$IDENTITY" --timestamp "$OUTPUT/$DMG_NAME"
 
-NOTARIZATION="NOT NOTARIZED — first launch may require macOS Privacy & Security > Open Anyway."
+NOTARIZATION="Not notarized. If blocked, use Privacy & Security > Open Anyway."
 if [[ -n "$PROFILE" ]]; then
   xcrun notarytool submit "$OUTPUT/$DMG_NAME" --keychain-profile "$PROFILE" --wait --output-format json > "$STAGE/notary-result.json"
   STATUS="$(plutil -extract status raw "$STAGE/notary-result.json")"
@@ -64,7 +63,7 @@ if [[ -n "$PROFILE" ]]; then
   xcrun stapler staple "$APP"
   codesign --verify --strict "$APP"
   spctl --assess --type execute --verbose=2 "$APP"
-  NOTARIZATION="Apple notarized; the disk image and source app have stapled tickets."
+  NOTARIZATION="Apple notarized."
 fi
 
 SOURCE_ROOT="$STAGE/$PREFIX-source"
@@ -86,10 +85,10 @@ COPYFILE_DISABLE=1 tar --no-xattrs \
 cat > "$OUTPUT/RELEASE-NOTES.md" <<EOF
 # Auto Recorder $VERSION
 
-- Requirements: Apple Silicon (arm64), macOS 15 or later. Intel Macs are not supported.
+- Requirements: Apple Silicon, macOS 15+.
 - Installation: open $DMG_NAME, drag Auto Recorder.app onto Applications, eject the image, then open the installed app.
 - First use: allow screen recording; microphone permission is requested only when enabled.
-- Signature: $IDENTITY; hardened runtime enabled; secure timestamp: $TIMESTAMP.
+- Signature: Developer ID signed.
 - Notarization: $NOTARIZATION
 - License: GPL-3.0-only. Complete matching source is provided in $SOURCE_NAME alongside this binary.
 - Verify downloads with: shasum -a 256 -c SHA256SUMS.txt

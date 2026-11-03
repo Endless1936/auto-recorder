@@ -1,49 +1,28 @@
 name: Bug report
-description: Report an installation, recording, or editing problem.
+description: Report a problem.
 title: "[Bug] "
 body:
   - type: input
-    id: app-version
+    id: version
     attributes:
-      label: Auto Recorder version
-      placeholder: Find it in About Auto Recorder
+      label: App version
     validations:
       required: true
   - type: input
-    id: macos-version
+    id: environment
     attributes:
-      label: macOS version
-      placeholder: For example, macOS 15.7
-    validations:
-      required: true
-  - type: input
-    id: chip
-    attributes:
-      label: Mac chip
-      description: Apple Silicon and macOS 15+ are currently required.
-      placeholder: For example, Apple M1 Pro
-    validations:
-      required: true
-  - type: dropdown
-    id: install-source
-    attributes:
-      label: How was the app installed?
-      options:
-        - GitHub Release DMG
-        - GitHub Release ZIP
-        - Built from source
-        - Other
+      label: macOS version and Mac chip
     validations:
       required: true
   - type: textarea
-    id: reproduction
+    id: problem
     attributes:
       label: What happened?
-      description: Include steps to reproduce, what you expected, and what actually happened.
+      description: Include the steps, expected result and actual result.
     validations:
       required: true
   - type: textarea
     id: evidence
     attributes:
-      label: Screenshot or relevant log
-      description: Optional. Remove private content; do not attach private recordings or complete project folders.
+      label: Screenshot or log (optional)
+      description: Remove private content; do not upload recordings or project folders.

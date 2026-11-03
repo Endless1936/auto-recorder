@@ -541,7 +541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "Auto Recorder",
             .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
-            .credits: NSAttributedString(string: "屏幕、窗口与区域录制\n工程与视频保存到本机\nGPL-3.0-only · 源码随发行版提供")
+            .credits: NSAttributedString(string: "GPL-3.0-only · 可修改和再分发 · 不提供担保\nhttps://github.com/Endless1936/auto-recorder")
         ])
     }
     private func showError(_ error: Error) {

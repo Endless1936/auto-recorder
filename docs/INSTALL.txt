@@ -1,21 +1,12 @@
-Auto Recorder — Installation
+Auto Recorder
 
-Requires an Apple Silicon Mac (M1 or later) with macOS 15 or later.
+Apple Silicon (M1 or later), macOS 15+.
 
-1. Drag Auto Recorder.app to the Applications shortcut.
-2. Eject this disk image, then open Auto Recorder from Applications.
-3. Allow screen/system-audio recording when macOS requests it.
-   Microphone permission is requested only when microphone recording is enabled.
-   Saving to Desktop may also require permission for that folder.
+1. Drag Auto Recorder.app to Applications.
+2. Open it from Applications and allow screen recording.
+3. Allow microphone access when you enable it.
 
-This disk image does not install anything automatically.
-Users do not need a developer account or keychain configuration.
+If first launch is blocked:
+System Settings > Privacy & Security > Open Anyway.
 
-If macOS cannot verify this build, first check the release notes and download
-source. Only if you trust that source, try opening the app once, then use
-System Settings > Privacy & Security > Open Anyway and confirm Open.
-This one-time permission to run the app is separate from screen-recording
-permission. Do not disable Gatekeeper.
-
-License: GPL-3.0-only. Matching source and build instructions are supplied in the
-source.tar.gz archive beside this download. See LICENSE and SOURCE.txt.
+GPL-3.0-only. Source and license: see SOURCE.txt and LICENSE.

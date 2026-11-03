@@ -8,7 +8,7 @@
     <key>CFBundleVersion</key><string>23</string>
     <key>CFBundleShortVersionString</key><string>2.3.4</string>
     <key>CFBundleIconFile</key><string>AppIcon.icns</string>
-    <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Auto Recorder contributors. GPL-3.0-only.</string>
+    <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Auto Recorder contributors.</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>

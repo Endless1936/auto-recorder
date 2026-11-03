@@ -1,6 +1,6 @@
 # Contributing
 
-Use an Apple Silicon Mac with macOS 15 or later and Apple's Command Line Tools. The UI currently uses Chinese. Keep changes focused on screen recording, simple cuts, and editable framing.
+Use an Apple Silicon Mac, macOS 15+ and Apple's Command Line Tools. Keep changes focused on recording, simple cuts and editable framing.
 
 ## Build and check
 
@@ -13,19 +13,14 @@ APP="dist/Auto Recorder.app/Contents/MacOS/AutoRecorder"
 "$APP" --pause-test "$(mktemp -d "${TMPDIR:-/tmp}/auto-recorder-pause.XXXXXX")"
 ```
 
-Use fresh test directories. These checks create synthetic media; they do not require permission to capture the screen or microphone. Hardware capture, audio preview, and native UI checks need a real logged-in desktop and the relevant macOS permissions, and are separate from CI.
+These checks use synthetic media. Hardware and UI checks need a logged-in desktop and the relevant permissions. Run the checks affected by your change; verify preview/export agreement and protect original recordings.
 
-For a change, run the checks that exercise its behavior. For recording or editor changes, also verify the affected flow in the app. Protect the original recording, keep project-folder portability, and check that preview and export agree after edits.
+## Contributions
 
-## Pull requests
+- Explain the change and validation.
+- Keep generated files, credentials, personal paths and private recordings out of Git.
+- Add a meaningful regression check for behavior fixes; use screenshots without private content for visual changes.
+- Keep user-facing copy focused on actions, not implementation history or design trade-offs.
+- The AI-generated icon's PNG is the editable source; ICNS contains native app sizes. Keep both when updating the icon.
 
-- Explain the problem, the resulting behavior, and what you tested.
-- Keep generated apps, installers, recordings, local reports, credentials, and personal paths out of commits.
-- Add or update a regression check when fixing behavior that can be tested meaningfully.
-- For visual changes, include a screenshot without private recording content.
-
-Contributions are distributed under this project's [GPL-3.0-only license](LICENSE). Only contribute material you have the right to license under those terms. No contributor license agreement is required.
-
-## Releases
-
-See [docs/RELEASING.md](docs/RELEASING.md). Public packages need their matching source archive and license. A successful CI build is not a notarized release or proof of installation on another Mac.
+Contributions use [GPL-3.0-only](LICENSE). See [release instructions](docs/RELEASING.md) for packaging.

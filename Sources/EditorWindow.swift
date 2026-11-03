@@ -1039,7 +1039,7 @@ private struct ProductionZoomGraph: View {
                 graph(size: geo.size)
             }
             VStack(spacing: 3) {
-                EditorIcon(symbol: "viewfinder", help: "取景框：显示原片取景区域与运动路径，暂停后可直接拖动当前取景框",
+                EditorIcon(symbol: "viewfinder", help: "显示取景框与路径（暂停后可拖动）",
                            selected: model.showsFramingOverlay, controlHeight: 26, action: model.toggleFramingOverlay)
                     .accessibilityIdentifier("editor.framing.toggle")
                     .accessibilityValue(model.showsFramingOverlay ? "已开启" : "已关闭")
@@ -1221,7 +1221,7 @@ private struct ProductionZoomGraph: View {
                     snapGuideScale = nil
                 })
             .help(endpoint ? "全景端点：左右调整时间，倍率固定为 1×" :
-                  "倍率控制点：左右调整时间，上下调整倍率；空白处拖动框选，Shift 点击追加，Option 暂停吸附")
+                  "左右调整时间，上下调整倍率；空白处框选")
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(endpoint ? "全景端点" : "倍率控制点")
             .accessibilityValue(String(format: "时间 %.6f，倍率 %.6f，%@", item.offset + control.time, control.scale, selected ? "已选择" : "未选择"))
