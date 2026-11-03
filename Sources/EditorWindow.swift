@@ -3,6 +3,27 @@ import AVFoundation
 import Combine
 import SwiftUI
 
+/// Shared visible fraction of the project. This is navigation state, never an edit.
+struct EditorTimeViewport: Equatable {
+    static let maximumScale = 64.0
+    var scale = 1.0
+    var start = 0.0
+    var maximumStart: Double { max(0, 1 - 1 / scale) }
+
+    mutating func zoom(by factor: Double, anchor: Double) {
+        guard factor.isFinite, factor > 0, anchor.isFinite else { return }
+        let anchor = min(1, max(0, anchor))
+        let time = start + anchor / scale
+        scale = min(Self.maximumScale, max(1, scale * factor))
+        start = min(maximumStart, max(0, time - anchor / scale))
+    }
+
+    mutating func pan(by fraction: Double) {
+        guard fraction.isFinite else { return }
+        start = min(maximumStart, max(0, start + fraction))
+    }
+}
+
 @MainActor
 final class EditorWindow: NSWindow, NSWindowDelegate {
     private let editorModel: EditorModel
@@ -57,12 +78,42 @@ final class EditorWindow: NSWindow, NSWindowDelegate {
     }
 
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .scrollWheel, isKeyWindow, attachedSheet == nil, event.window === self,
+           let contentView {
+            let point = contentView.convert(event.locationInWindow, from: nil)
+            let y = contentView.isFlipped ? point.y : contentView.bounds.height - point.y
+            let top = 76 + max(220, contentView.bounds.height - 330) + 16
+            let axis = EditorTimeAxisGeometry(containerWidth: contentView.bounds.width - 48)
+            if y >= top, y <= top + 218, point.x >= 24 + axis.canvasMinX, point.x <= 24 + axis.canvasMaxX {
+                if event.modifierFlags.contains(.command) {
+                    let delta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.scrollingDeltaX
+                    let sensitivity = event.hasPreciseScrollingDeltas ? 0.015 : 0.15
+                    editorModel.zoomTimeAxis(by: exp(min(1, max(-1, Double(delta) * sensitivity))),
+                                            anchor: Double((point.x - 24 - axis.minX) / axis.width))
+                } else {
+                    let delta = event.scrollingDeltaX != 0 ? event.scrollingDeltaX : event.scrollingDeltaY
+                    editorModel.panTimeAxis(by: -Double(delta) / Double(axis.width) / editorModel.timeViewport.scale)
+                }
+                return
+            }
+        }
         guard event.type == .keyDown, isKeyWindow, attachedSheet == nil,
               event.window === self, !isEditingText else {
             super.sendEvent(event)
             return
         }
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if modifiers.contains(.command), !modifiers.contains(.control), !modifiers.contains(.option) {
+            let text = event.charactersIgnoringModifiers ?? ""
+            let increase = text == "+" || text == "=" || event.keyCode == 69
+            let decrease = text == "-" || text == "−" || event.keyCode == 78
+            if increase || decrease {
+                let time = editorModel.playhead / max(0.001, editorModel.totalDuration)
+                let position = (time - editorModel.timeViewport.start) * editorModel.timeViewport.scale
+                editorModel.zoomTimeAxis(by: increase ? 1.25 : 0.8, anchor: (0...1).contains(position) ? position : 0.5)
+                return
+            }
+        }
         if (event.keyCode == 126 || event.keyCode == 125),
            modifiers.isEmpty, !editorModel.isExporting {
             _ = editorModel.navigateCameraTarget(forward: event.keyCode == 125)
@@ -177,7 +228,11 @@ private struct EditorContent: View {
                     ProductionZoomGraph(model: model)
                         .frame(height: 116)
                         .padding(.top, 14)
-                        .padding(.bottom, 20)
+                    EditorTimeScroller(model: model)
+                        .frame(height: 12)
+                        .padding(.leading, EditorTimeAxisGeometry.leadingInset)
+                        .padding(.trailing, EditorTimeAxisGeometry.trailingInset)
+                        .padding(.vertical, 4)
                 }
                 .padding(.horizontal, 24)
             }
@@ -661,23 +716,61 @@ struct EditorTimeAxisGeometry {
     static let trailingInset: CGFloat = toolColumnWidth + toolSpacing + timePadding
 
     let containerWidth: CGFloat
+    var viewport = EditorTimeViewport()
     var canvasMinX: CGFloat { Self.scaleLabelWidth + Self.scaleLabelSpacing }
     var canvasMaxX: CGFloat { max(canvasMinX + Self.timePadding * 2 + 1, containerWidth - Self.toolColumnWidth - Self.toolSpacing) }
     var canvasWidth: CGFloat { canvasMaxX - canvasMinX }
     var minX: CGFloat { canvasMinX + Self.timePadding }
     var maxX: CGFloat { canvasMaxX - Self.timePadding }
     var width: CGFloat { maxX - minX }
+    var contentWidth: CGFloat { width * viewport.scale }
 
     func x(at time: Double, total: Double) -> CGFloat {
-        minX + CGFloat(time / max(0.001, total)) * width
+        minX + CGFloat(time / max(0.001, total) - viewport.start) * contentWidth
     }
 
     func time(at x: CGFloat, total: Double) -> Double {
-        min(max(0, total), max(0, Double((x - minX) / width) * max(0, total)))
+        min(max(0, total), max(0, (Double((x - minX) / contentWidth) + viewport.start) * max(0, total)))
     }
 
     func timeDelta(for translation: CGFloat, total: Double) -> Double {
-        Double(translation / width) * max(0, total)
+        Double(translation / contentWidth) * max(0, total)
+    }
+}
+
+private struct EditorTimeScroller: NSViewRepresentable {
+    @ObservedObject var model: EditorModel
+    func makeCoordinator() -> Coordinator { Coordinator(model: model) }
+    func makeNSView(context: Context) -> NSScroller {
+        let view = NSScroller(frame: NSRect(x: 0, y: 0, width: 100, height: 12))
+        view.scrollerStyle = .legacy
+        view.knobStyle = .light
+        view.controlSize = .small
+        view.target = context.coordinator
+        view.action = #selector(Coordinator.scroll(_:))
+        view.setAccessibilityIdentifier("editor.timeAxis.scroller")
+        view.setAccessibilityLabel("共同时间范围")
+        view.toolTip = "⌘＋滚轮或 ⌘＋／− 缩放，横向滚动查看细节"
+        return view
+    }
+    func updateNSView(_ view: NSScroller, context: Context) {
+        let value = model.timeViewport
+        view.knobProportion = 1 / value.scale
+        view.doubleValue = value.maximumStart > 0 ? value.start / value.maximumStart : 0
+        view.isEnabled = value.scale > 1
+        view.alphaValue = value.scale > 1 ? 1 : 0
+    }
+    @MainActor final class Coordinator: NSObject {
+        let model: EditorModel
+        init(model: EditorModel) { self.model = model }
+        @objc func scroll(_ sender: NSScroller) {
+            switch sender.hitPart {
+            case .decrementPage: model.panTimeAxis(by: -0.8 / model.timeViewport.scale)
+            case .incrementPage: model.panTimeAxis(by: 0.8 / model.timeViewport.scale)
+            default:
+                model.panTimeAxis(by: sender.doubleValue * model.timeViewport.maximumStart - model.timeViewport.start)
+            }
+        }
     }
 }
 
@@ -810,7 +903,7 @@ private struct ProductionTimeline: View {
 
     var body: some View {
         GeometryReader { geo in
-            let axis = EditorTimeAxisGeometry(containerWidth: geo.size.width)
+            let axis = EditorTimeAxisGeometry(containerWidth: geo.size.width, viewport: model.timeViewport)
             let total = max(0.001, model.totalDuration)
             let layouts = clipLayouts(axis: axis, total: total)
             EditorAxisDrawing(kind: .canvas, identifier: "editor.timeline.canvas")
@@ -823,31 +916,41 @@ private struct ProductionTimeline: View {
                 .frame(width: axis.width, height: 25)
                 .position(x: (axis.minX + axis.maxX) / 2, y: 12.5)
             ForEach(layouts) { layout in
-                clipCell(layout.clip, width: layout.frame.width, axis: axis, total: total,
-                         layouts: layouts, size: geo.size)
-                    .position(x: layout.frame.midX, y: layout.frame.midY)
-            }
-            Rectangle().fill(AppTheme.accent).frame(width: 1.5, height: 64)
-                .position(x: axis.x(at: model.playhead, total: total), y: 56)
-                .allowsHitTesting(false)
-            TimelinePlayheadTip().fill(AppTheme.accent)
-                .frame(width: 10, height: 20)
-                .frame(width: 32, height: 38, alignment: .top)
-                .contentShape(Rectangle())
-                .position(x: axis.x(at: model.playhead, total: total), y: 23)
-                .highPriorityGesture(scrubGesture(axis: axis, total: total))
-                .help("拖动播放头浏览视频")
-                .accessibilityLabel("播放头")
-                .accessibilityIdentifier("editor.timeline.playhead")
-                .accessibilityValue(appTime(model.playhead))
-                .accessibilityAdjustableAction { direction in
-                    model.skip(by: direction == .increment ? 1 : -1)
+                let visible = layout.frame.intersection(CGRect(x: axis.minX, y: 31, width: axis.width, height: 57))
+                if !visible.isNull, visible.width > 0 {
+                    clipCell(layout.clip, width: visible.width, axis: axis, total: total,
+                             layouts: layouts, size: geo.size,
+                             stripStart: layout.clip.sourceStart + Double((visible.minX - layout.frame.minX) / axis.contentWidth) * total,
+                             stripDuration: Double(visible.width / axis.contentWidth) * total,
+                             showStart: layout.frame.minX >= axis.minX - 0.5,
+                             showEnd: layout.frame.maxX <= axis.maxX + 0.5)
+                        .position(x: visible.midX, y: visible.midY)
                 }
+            }
+            if axis.x(at: model.playhead, total: total) >= axis.minX - 0.5,
+               axis.x(at: model.playhead, total: total) <= axis.maxX + 0.5 {
+                Rectangle().fill(AppTheme.accent).frame(width: 1.5, height: 64)
+                    .position(x: axis.x(at: model.playhead, total: total), y: 56)
+                    .allowsHitTesting(false)
+                TimelinePlayheadTip().fill(AppTheme.accent)
+                    .frame(width: 10, height: 20)
+                    .frame(width: 32, height: 38, alignment: .top)
+                    .contentShape(Rectangle())
+                    .position(x: axis.x(at: model.playhead, total: total), y: 23)
+                    .highPriorityGesture(scrubGesture(axis: axis, total: total))
+                    .help("拖动播放头浏览视频")
+                    .accessibilityLabel("播放头")
+                    .accessibilityIdentifier("editor.timeline.playhead")
+                    .accessibilityValue(appTime(model.playhead))
+                    .accessibilityAdjustableAction { direction in
+                        model.skip(by: direction == .increment ? 1 : -1)
+                    }
+            }
             if let drag = reorderState {
                 if let insertion = drag.insertion {
                     Rectangle().fill(AppTheme.accent).frame(width: 3, height: 62)
                         .overlay(alignment: .top) { Circle().fill(AppTheme.accent).frame(width: 7, height: 7) }
-                        .position(x: insertion.x, y: 57)
+                        .position(x: min(axis.maxX, max(axis.minX, insertion.x)), y: 57)
                         .allowsHitTesting(false)
                 }
                 if let clip = model.clips.first(where: { $0.id == drag.clipID }) {
@@ -872,8 +975,10 @@ private struct ProductionTimeline: View {
         let width = axis.width
         return ZStack(alignment: .topLeading) {
             ForEach(0..<9) { index in
-                let time = total * Double(index) / 8
-                Text(total < 10 ? EditorModel.timeLabel(time) : appTime(time))
+                let time = axis.time(at: axis.minX + width * CGFloat(index) / 8, total: total)
+                let span = total / model.timeViewport.scale
+                Text(span < 2 ? String(format: span < 0.2 ? "%.3f" : "%.2f", time)
+                     : total < 10 ? EditorModel.timeLabel(time) : appTime(time))
                     .font(.system(size: 11)).monospacedDigit()
                     .foregroundStyle(AppTheme.secondary)
                     .position(x: max(17, min(width - 17, width * CGFloat(index) / 8)), y: 7)
@@ -952,10 +1057,11 @@ private struct ProductionTimeline: View {
     }
 
     private func clipCell(_ clip: DemoClip, width: CGFloat, axis: EditorTimeAxisGeometry, total: Double,
-                          layouts: [TimelineClipLayout], size: CGSize) -> some View {
+                          layouts: [TimelineClipLayout], size: CGSize, stripStart: Double, stripDuration: Double,
+                          showStart: Bool, showEnd: Bool) -> some View {
         let selected = model.editingSelectionTarget == .clip && model.selectedClipID == clip.id
         return ZStack {
-            ClipFrameStrip(source: model.sourceURL, start: clip.sourceStart, duration: clip.duration)
+            ClipFrameStrip(source: model.sourceURL, start: stripStart, duration: stripDuration)
             if !selected { Color.black.opacity(0.22) }
         }
         .frame(width: max(0, width - 3), height: 51)
@@ -971,8 +1077,8 @@ private struct ProductionTimeline: View {
         }
         .gesture(reorderGesture(for: clip.id, layouts: layouts, size: size))
         .opacity(reorderState?.clipID == clip.id ? 0.45 : 1)
-        .overlay(alignment: .leading) { if selected { trimHandle(clip, edge: 0, width: width, axis: axis, total: total) } }
-        .overlay(alignment: .trailing) { if selected { trimHandle(clip, edge: 1, width: width, axis: axis, total: total) } }
+        .overlay(alignment: .leading) { if selected && showStart { trimHandle(clip, edge: 0, width: width, axis: axis, total: total) } }
+        .overlay(alignment: .trailing) { if selected && showEnd { trimHandle(clip, edge: 1, width: width, axis: axis, total: total) } }
         .help("点击选择；拖动调整顺序；拖动两端裁剪")
         .accessibilityElement(children: .contain)
         .accessibilityLabel("视频片段，\(appTime(clip.duration))")
@@ -1035,18 +1141,23 @@ private struct ClipFrameStrip: View {
         }
         .task(id: "\(source?.path ?? "")|\(start)|\(duration)") {
             guard let source else { images = []; return }
-            let result = await Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: 70_000_000)
+            guard !Task.isCancelled else { return }
+            let extraction = Task.detached(priority: .utility) {
                 let generator = AVAssetImageGenerator(asset: AVURLAsset(url: source))
                 generator.appliesPreferredTrackTransform = true
                 generator.maximumSize = CGSize(width: 240, height: 135)
-                generator.requestedTimeToleranceBefore = CMTime(seconds: 0.2, preferredTimescale: 600)
-                generator.requestedTimeToleranceAfter = CMTime(seconds: 0.2, preferredTimescale: 600)
+                let tolerance = min(0.2, max(1.0 / 120, duration / 32))
+                generator.requestedTimeToleranceBefore = CMTime(seconds: tolerance, preferredTimescale: 600)
+                generator.requestedTimeToleranceAfter = CMTime(seconds: tolerance, preferredTimescale: 600)
                 return (0..<8).compactMap { index -> NSImage? in
-                    let seconds = start + max(0, duration - 0.04) * (Double(index) + 0.5) / 8
+                    guard !Task.isCancelled else { return nil }
+                    let seconds = start + max(0, duration - min(0.04, duration * 0.1)) * (Double(index) + 0.5) / 8
                     guard let image = try? generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600), actualTime: nil) else { return nil }
                     return NSImage(cgImage: image, size: .zero)
                 }
-            }.value
+            }
+            let result = await withTaskCancellationHandler(operation: { await extraction.value }, onCancel: { extraction.cancel() })
             guard !Task.isCancelled else { return }
             images = result
         }
@@ -1091,7 +1202,7 @@ private struct ProductionZoomGraph: View {
             ZStack(alignment: .trailing) {
                 graph(size: geo.size)
                 VStack(spacing: 3) {
-                    EditorIcon(symbol: "viewfinder", help: "显示取景框与路径（暂停后可拖动）",
+                    EditorIcon(symbol: "viewfinder", help: "显示取景框（暂停后可拖动）",
                                selected: model.showsFramingOverlay, controlHeight: 26, action: model.toggleFramingOverlay)
                         .accessibilityIdentifier("editor.framing.toggle")
                         .accessibilityValue(model.showsFramingOverlay ? "已开启" : "已关闭")
@@ -1114,7 +1225,7 @@ private struct ProductionZoomGraph: View {
     }
 
     private func graph(size: CGSize) -> some View {
-        let axis = EditorTimeAxisGeometry(containerWidth: size.width)
+        let axis = EditorTimeAxisGeometry(containerWidth: size.width, viewport: model.timeViewport)
         let left = axis.minX
         let top: CGFloat = 16
         let bottom: CGFloat = 18
@@ -1132,47 +1243,55 @@ private struct ProductionZoomGraph: View {
             EditorScaleLabels(maximum: maximum, top: top, bottom: bottom)
                 .frame(width: EditorTimeAxisGeometry.scaleLabelWidth, height: size.height)
                 .position(x: EditorTimeAxisGeometry.scaleLabelWidth / 2, y: size.height / 2)
-            EditorAxisDrawing(kind: .grid, identifier: "editor.zoomGraph.dataFrame", maximum: maximum)
-                .frame(width: axis.width, height: height)
-                .position(x: (axis.minX + axis.maxX) / 2, y: top + height / 2)
-            effectiveCurve(width: width, total: total, point: point)
-                .stroke(AppTheme.accent.opacity(0.38),
-                        style: StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round))
-            if let selected = locations.first(where: isSelected) {
-                zoomFill(selected, point: point).fill(AppTheme.accent.opacity(0.045))
-                zoomCurve(selected, point: point)
-                    .stroke(AppTheme.accent,
-                            style: StrokeStyle(lineWidth: 2.8, lineCap: .round, lineJoin: .round))
-            }
-            ForEach(locations) { item in
-                if isSelected(item) {
-                    ForEach(item.zoom.cameraControlPoints) { control in
-                        if control.time >= 0 && control.time <= item.clip.duration {
-                            cameraNode(control, item: item, axis: axis, height: height,
-                                       total: total, range: range, point: point)
+            ZStack(alignment: .topLeading) {
+                EditorAxisDrawing(kind: .grid, identifier: "editor.zoomGraph.dataFrame", maximum: maximum)
+                    .frame(width: axis.width, height: height)
+                    .position(x: (axis.minX + axis.maxX) / 2, y: top + height / 2)
+                effectiveCurve(width: width, total: total, point: point)
+                    .stroke(AppTheme.accent.opacity(0.38),
+                            style: StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round))
+                if let selected = locations.first(where: isSelected) {
+                    zoomFill(selected, point: point).fill(AppTheme.accent.opacity(0.045))
+                    zoomCurve(selected, point: point)
+                        .stroke(AppTheme.accent,
+                                style: StrokeStyle(lineWidth: 2.8, lineCap: .round, lineJoin: .round))
+                }
+                ForEach(locations) { item in
+                    if isSelected(item) {
+                        ForEach(item.zoom.cameraControlPoints) { control in
+                            if control.time >= 0 && control.time <= item.clip.duration,
+                               axis.x(at: item.offset + control.time, total: total) >= axis.minX - 0.5,
+                               axis.x(at: item.offset + control.time, total: total) <= axis.maxX + 0.5 {
+                                cameraNode(control, item: item, axis: axis, height: height,
+                                           total: total, range: range, point: point)
+                            }
                         }
                     }
                 }
-            }
-            if let scale = snapGuideScale {
-                Path { path in
-                    path.move(to: point(0, scale))
-                    path.addLine(to: point(total, scale))
-                }
-                .stroke(AppTheme.accent.opacity(0.75), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                .allowsHitTesting(false)
-                .accessibilityLabel("倍率水平吸附线")
-                .accessibilityIdentifier("editor.zoomGraph.snapGuide")
-            }
-            if let rect = marqueeRect, !rect.isNull {
-                Rectangle().fill(AppTheme.accent.opacity(0.10))
-                    .overlay(Rectangle().strokeBorder(AppTheme.accent.opacity(0.85), lineWidth: 1))
-                    .frame(width: rect.width, height: rect.height)
-                    .position(x: rect.midX, y: rect.midY)
+                if let scale = snapGuideScale {
+                    Path { path in
+                        path.move(to: point(0, scale))
+                        path.addLine(to: point(total, scale))
+                    }
+                    .stroke(AppTheme.accent.opacity(0.75), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
                     .allowsHitTesting(false)
-                    .accessibilityLabel("框选倍率控制点")
-                    .accessibilityIdentifier("editor.zoomGraph.marquee")
+                    .accessibilityLabel("倍率水平吸附线")
+                    .accessibilityIdentifier("editor.zoomGraph.snapGuide")
+                }
+                if let rect = marqueeRect, !rect.isNull {
+                    Rectangle().fill(AppTheme.accent.opacity(0.10))
+                        .overlay(Rectangle().strokeBorder(AppTheme.accent.opacity(0.85), lineWidth: 1))
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
+                        .allowsHitTesting(false)
+                        .accessibilityLabel("框选倍率控制点")
+                        .accessibilityIdentifier("editor.zoomGraph.marquee")
+                }
             }
+            .frame(width: size.width, height: size.height)
+            .mask(Rectangle().frame(width: axis.canvasWidth, height: size.height)
+                .position(x: (axis.canvasMinX + axis.canvasMaxX) / 2, y: size.height / 2))
+            .contentShape(Path(CGRect(x: axis.canvasMinX, y: 0, width: axis.canvasWidth, height: size.height)))
         }
         .overlay(alignment: .topTrailing) {
             if hasOverlappingZooms {
@@ -1322,27 +1441,36 @@ private struct ProductionZoomGraph: View {
         Path { path in
             var offset = 0.0
             for clip in model.clips {
-                let samples = max(24, Int(width * clip.duration / total) * 2)
-                var times = (0...samples).map { clip.duration * Double($0) / Double(samples) }
+                let clipOffset = offset
+                offset += clip.duration
+                let lower = max(0, model.timeViewport.start * total - clipOffset)
+                let upper = min(clip.duration, (model.timeViewport.start + 1 / model.timeViewport.scale) * total - clipOffset)
+                guard upper >= lower else { continue }
+                let samples = max(24, Int(Double(width) * (upper - lower) / (total / model.timeViewport.scale)) * 2)
+                var times = (0...samples).map { lower + (upper - lower) * Double($0) / Double(samples) }
                 times.append(contentsOf: clip.canonicalZooms().flatMap { $0.cameraControlPoints.map(\.time) }
-                    .filter { $0 > 0 && $0 < clip.duration })
+                    .filter { $0 > lower && $0 < upper })
                 for time in Set(times).sorted() {
-                    let position = point(offset + time, clip.scale(at: time))
+                    let position = point(clipOffset + time, clip.scale(at: time))
                     if path.isEmpty { path.move(to: position) }
                     else { path.addLine(to: position) }
                 }
-                offset += clip.duration
             }
         }
     }
 
+    private func visibleBounds(_ item: CurveLocation) -> (Double, Double) {
+        let duration = max(0.001, model.totalDuration)
+        return (max(0, item.zoom.start, model.timeViewport.start * duration - item.offset),
+                min(item.clip.duration, item.zoom.end, (model.timeViewport.start + 1 / model.timeViewport.scale) * duration - item.offset))
+    }
+
     private func zoomCurve(_ item: CurveLocation, point: (Double, Double) -> CGPoint) -> Path {
         Path { path in
-            let lower = max(0, item.zoom.start)
-            let upper = min(item.clip.duration, item.zoom.end)
+            let (lower, upper) = visibleBounds(item)
             guard upper > lower else { return }
             if item.zoom.cameraKeyframes != nil {
-                let count = max(64, Int((upper - lower) / max(0.001, model.totalDuration) * 2000))
+                let count = max(64, Int((upper - lower) / max(0.001, model.totalDuration / model.timeViewport.scale) * 2000))
                 var times = (0...count).map { lower + (upper - lower) * Double($0) / Double(count) }
                 times.append(contentsOf: item.zoom.cameraControlPoints.map(\.time).filter { $0 > lower && $0 < upper })
                 for time in Set(times).sorted() {
@@ -1377,7 +1505,7 @@ private struct ProductionZoomGraph: View {
 
     private func zoomFill(_ item: CurveLocation, point: (Double, Double) -> CGPoint) -> Path {
         var path = zoomCurve(item, point: point)
-        let lower = max(0, item.zoom.start), upper = min(item.clip.duration, item.zoom.end)
+        let (lower, upper) = visibleBounds(item)
         guard upper > lower else { return path }
         path.addLine(to: point(item.offset + upper, 1))
         path.addLine(to: point(item.offset + lower, 1))

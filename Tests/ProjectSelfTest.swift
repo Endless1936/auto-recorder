@@ -135,6 +135,7 @@ enum ProjectSelfTest {
     }
 
     static func runLogic() throws {
+        try checkTimeViewport()
         try checkLocalFramingCorrection()
         try checkSimpleCameraInterpolation()
         try checkPositionOnlyCameraInterpolation()
@@ -245,6 +246,49 @@ enum ProjectSelfTest {
                   repairedZoom.riseEnd < repairedZoom.fallStart && repairedZoom.fallStart < repairedZoom.end,
                   "重开时没有修复退化时序，或错误重新生成了用户镜头")
         print("PASS saved control repair: degenerate timing repaired without replacing camera identity, amplitude or pointer trace")
+    }
+
+    private static func checkTimeViewport() throws {
+        var viewport = EditorTimeViewport()
+        viewport.zoom(by: 4, anchor: 0.4)
+        try check(viewport.scale == 4 && abs(viewport.start - 0.3) < 1e-12,
+                  "时间轴缩放没有保持鼠标锚定的时间")
+        for width in [932.0, 1132, 1800] {
+            let axis = EditorTimeAxisGeometry(containerWidth: width, viewport: viewport)
+            try check(abs(axis.time(at: axis.minX, total: 120) - 36) < 1e-8 &&
+                      abs(axis.time(at: axis.maxX, total: 120) - 66) < 1e-8,
+                      "缩放后的可见时间范围不正确")
+            for time in stride(from: 36.0, through: 66.0, by: 0.125) {
+                try check(abs(axis.time(at: axis.x(at: time, total: 120), total: 120) - time) < 1e-8,
+                          "时间与横坐标转换不一致")
+            }
+            try check(abs(axis.timeDelta(for: axis.width / 2, total: 120) - 15) < 1e-8,
+                      "放大后拖动节点仍使用未缩放的时间比例")
+        }
+        for _ in 0..<100 {
+            viewport.zoom(by: 1.25, anchor: 0.9)
+            viewport.pan(by: 100)
+            try check(viewport.scale >= 1 && viewport.scale <= EditorTimeViewport.maximumScale &&
+                      viewport.start >= 0 && viewport.start + 1 / viewport.scale <= 1 + 1e-12,
+                      "放大或滚动使时间范围越过素材尾部，露出空白")
+        }
+        for _ in 0..<100 { viewport.zoom(by: 0.8, anchor: 0.2); viewport.pan(by: -100) }
+        try check(viewport.scale == 1 && viewport.start == 0, "时间轴能缩到100%以下或无法恢复完整范围")
+        let model = EditorModel()
+        model.clips = [DemoClip(title: "视图缩放", sourceStart: 0, duration: 120, zooms: [.standard(duration: 120)])]
+        model.seek(30)
+        let clips = model.clips, time = model.playhead
+        model.zoomTimeAxis(by: 4, anchor: 0.25)
+        model.panTimeAxis(by: 0.1)
+        try check(model.clips == clips && model.playhead == time && !model.canUndo,
+                  "时间轴缩放/滚动修改了工程、播放时间或撤销历史")
+        let before = model.timeViewport
+        model.beginEditing()
+        model.zoomTimeAxis(by: 2, anchor: 0.5)
+        model.panTimeAxis(by: 0.2)
+        model.endEditing()
+        try check(model.timeViewport == before, "节点编辑中缩放视图改变了正在拖动的坐标系")
+        print("PASS shared timeline viewport: 100%-6400% bounds, cursor anchoring, shared time/pixel mapping, scaled drag deltas, bounded panning, exact full-fit reset and no content/playhead/Undo mutations")
     }
 
     private static func checkLocalFramingCorrection() throws {

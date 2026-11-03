@@ -1010,6 +1010,7 @@ enum ProjectStore {
 
 @MainActor
 final class EditorModel: ObservableObject {
+    @Published private(set) var timeViewport = EditorTimeViewport()
     @Published var clips: [DemoClip]
     @Published var selectedClipID: UUID?
     @Published var selectedZoomID: UUID?
@@ -1081,6 +1082,14 @@ final class EditorModel: ObservableObject {
 
     var totalDuration: Double { clips.reduce(0) { $0 + $1.duration } }
     var duration: Double { totalDuration }
+    func zoomTimeAxis(by factor: Double, anchor: Double) {
+        guard editingSnapshot == nil, !clips.isEmpty else { return }
+        timeViewport.zoom(by: factor, anchor: anchor)
+    }
+    func panTimeAxis(by fraction: Double) {
+        guard editingSnapshot == nil else { return }
+        timeViewport.pan(by: fraction)
+    }
     var canUndo: Bool { !history.isEmpty || editingSnapshot != nil }
     var selectedClip: DemoClip? { clips.first { $0.id == selectedClipID } }
     var activeClip: DemoClip? { position(at: playhead).map { clips[$0.index] } }
@@ -1997,6 +2006,7 @@ final class EditorModel: ObservableObject {
             // after the final async boundary has accepted this generation.
             previewGeneration = UUID()
             project = loaded
+            timeViewport = EditorTimeViewport()
             sourceURL = loaded.sourceURL; projectURL = loaded.folderURL
             fps = loaded.fps; quality = loaded.quality; sourcePixelSize = size
             clips = loaded.clips; selectedClipID = selection?.id; selectedZoomID = zoomID

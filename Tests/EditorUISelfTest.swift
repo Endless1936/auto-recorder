@@ -164,10 +164,179 @@ enum EditorUISelfTest {
             }
 
             try await checkTimeAxisAlignment(original: original)
+            try await checkSharedAxisZoom(original: original)
             try await checkPreviewControls(original: original)
             try require(model.clips == original, "The native UI test left content edits behind.")
             try screenshot("final")
             try requireNoRuntimeErrors()
+        }
+
+        func checkSharedAxisZoom(original: [DemoClip]) async throws {
+            let began = Date()
+            let previousClip = model.selectedClipID, previousZoom = model.selectedZoomID, previousTime = model.playhead
+            let clip = original[0], duration = clip.duration
+            let controls = zip([0.05, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 0.95], [1.0, 1.4, 1.8, 2, 1.6, 2.2, 1.5, 1]).map {
+                CameraKeyframe(time: duration * $0.0, scale: $0.1)
+            }
+            let zoom = ZoomSegment(start: controls[0].time, riseEnd: controls[1].time,
+                fallStart: controls[6].time, end: controls[7].time, peak: 2.2,
+                manualFocus: true, cameraKeyframes: controls).normalized()
+            var fixture = original
+            fixture[0].zooms = [zoom]
+            model.clips = fixture; model.selectedClipID = clip.id; model.selectedZoomID = zoom.id
+            model.seek(controls[3].time)
+            try model.autosave()
+            try await model.rebuildPreview()
+            await refreshDisplayedLayout()
+            guard let folder = model.projectURL, let rawItem = model.player.currentItem else { throw failure("Zoom fixture is not ready.") }
+            let jsonURL = folder.appendingPathComponent("project.json")
+            let saved = try Data(contentsOf: jsonURL), canUndo = model.canUndo
+            let a = "editor.zoom.\(zoom.id.uuidString).anchor.\(controls[3].id.uuidString)"
+            let b = "editor.zoom.\(zoom.id.uuidString).anchor.\(controls[4].id.uuidString)"
+            let originalSpacing = (try frame(b)).midX - (try frame(a)).midX
+            let anchoredX = (try frame("editor.timeline.playhead")).midX
+            for shifted in [false, true, false] { try await timeZoomKey(increase: true, shifted: shifted) }
+            try require(abs(model.timeViewport.scale - pow(1.25, 3)) < 1e-9 &&
+                        abs((try frame("editor.timeline.playhead")).midX - anchoredX) <= 1 &&
+                        abs(((try frame(b)).midX - (try frame(a)).midX) / originalSpacing - model.timeViewport.scale) < 0.02,
+                        "Command-plus did not expand both axes around their shared playhead.")
+            let ruler = try frame("editor.timeline.ruler"), graph = try frame("editor.zoomGraph")
+            let anchor = NSPoint(x: ruler.minX + ruler.width * 0.6, y: ruler.midY)
+            let beforeWheel = model.timeViewport
+            try await timeScroll(at: anchor, vertical: 3, command: true)
+            try require(model.timeViewport.scale > beforeWheel.scale,
+                        "Command-wheel over the video timeline did not zoom.")
+            let cursorTime = beforeWheel.start + 0.6 / beforeWheel.scale
+            try require(abs((cursorTime - model.timeViewport.start) * model.timeViewport.scale - 0.6) < 1e-8,
+                        "Command-wheel lost the time under the cursor.")
+            try await timeScroll(at: NSPoint(x: anchor.x, y: graph.midY), vertical: -3, command: true)
+            try require(abs(model.timeViewport.scale - beforeWheel.scale) < 1e-8 &&
+                        abs(model.timeViewport.start - beforeWheel.start) < 1e-8,
+                        "Wheel zoom on the animation axis uses a separate range or scale.")
+            let scrollingBefore = model.timeViewport.start
+            try await timeScroll(at: anchor, horizontal: -80)
+            try require(model.timeViewport.start > scrollingBefore,
+                        "Horizontal scrolling did not pan the shared view.")
+            let viewport = model.timeViewport
+            let total = model.totalDuration
+            let timeAtMiddle = (viewport.start + 0.5 / viewport.scale) * total
+            try await click(at: NSPoint(x: ruler.midX, y: ruler.midY))
+            try require(abs(model.playhead - timeAtMiddle) < 0.005,
+                        "Ruler scrubbing ignored shared zoom/panning.")
+            let y = try cameraGraphPoint(globalTime: timeAtMiddle, scale: 2.9).y
+            try await click(at: NSPoint(x: ruler.midX, y: y))
+            try require(abs(model.playhead - timeAtMiddle) < 0.005,
+                        "Animation-axis scrubbing uses a different visible time range.")
+            try require(model.clips == fixture && model.canUndo == canUndo && model.player.currentItem === rawItem,
+                        "Zooming, scrolling or scrubbing edited content/Undo or replaced the player.")
+            // Only the explicit seek above changes the in-memory playhead. View
+            // navigation itself must not write the saved project.
+            try require(try Data(contentsOf: jsonURL) == saved, "View zoom/pan rewrote project.json.")
+            // Return the visible window to the playhead's original anchor, then
+            // test actual node dragging at the magnified time/pixel scale.
+            try await timeScroll(at: anchor, horizontal: 80)
+            let beforeDragViewport = model.timeViewport
+            let start = center(try frame(b))
+            let targetTime = controls[4].time + duration * 0.04
+            let target = try cameraGraphPoint(globalTime: targetTime, scale: 2.6)
+            try await drag(from: start, to: target)
+            guard let moved = model.selectedZoom?.cameraControlPoints.first(where: { $0.id == controls[4].id }) else {
+                throw failure("Magnified node drag lost its control.")
+            }
+            try require(abs(moved.time - targetTime) < 0.005 && abs(moved.scale - 2.6) < 0.05 &&
+                        abs((try frame("editor.timeline.playhead")).midX - target.x) < 1.5,
+                        "A magnified curve drag uses the old time scale or detaches the playhead.")
+            try screenshot("shared-axis-zoomed-node-drag")
+            try await undo()
+            try require(model.clips == fixture && model.timeViewport == beforeDragViewport,
+                        "Undo did not restore editing data while retaining view zoom.")
+            try await click(at: center(try clipFrame(clip.id)))
+            let trim = center(try frame("editor.clip.\(clip.id.uuidString).trim.end"))
+            let change = 24 / Double(ruler.width) / model.timeViewport.scale * total
+            try await drag(from: trim, to: NSPoint(x: trim.x - 24, y: trim.y))
+            try require(abs((model.clips.first?.duration ?? 0) - (clip.duration - change)) < 0.005,
+                        "Magnified trimming ignored the visible time scale.")
+            try await undo()
+            try require(model.clips == fixture && model.timeViewport == beforeDragViewport,
+                        "Trim Undo changed the shared viewport or failed to restore the clip.")
+            try await timeScroll(at: anchor, horizontal: -10_000)
+            try require(abs(model.timeViewport.start - model.timeViewport.maximumStart) < 1e-8 &&
+                        abs((try clipFrame(fixture.last!.id)).maxX - ruler.maxX) <= 1,
+                        "Panning past the end exposes blank timeline space.")
+            try screenshot("shared-axis-zoomed-end")
+            func findScroller(_ view: NSView) -> NSScroller? {
+                if let scroller = view as? NSScroller, scroller.accessibilityIdentifier() == "editor.timeAxis.scroller" { return scroller }
+                return view.subviews.compactMap { findScroller($0) }.first
+            }
+            guard let content = window.contentView, let scroller = findScroller(content) else {
+                throw failure("The zoomed view has no native shared scroller.")
+            }
+            let knob = scroller.convert(scroller.rect(for: .knob), to: nil)
+            try require(scroller.alphaValue == 1 && scroller.isEnabled && knob.width > 10 && knob.height > 0,
+                        "The shared scrollbar is hidden or has no usable knob.")
+            let panBeforeKnob = model.timeViewport.start
+            // AppKit scrollbars track synchronously; enqueue the entire native
+            // gesture before yielding so no physical mouse input is needed.
+            let grab = center(knob)
+            for (type, location) in [(NSEvent.EventType.leftMouseDown, grab),
+                                      (.leftMouseDragged, NSPoint(x: grab.x - 90, y: grab.y)),
+                                      (.leftMouseUp, NSPoint(x: grab.x - 90, y: grab.y))] {
+                guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1) else {
+                    throw failure("Cannot construct the native scrollbar gesture.")
+                }
+                NSApp.postEvent(event, atStart: false)
+            }
+            await settle(0.12)
+            try require(model.timeViewport.start < panBeforeKnob && model.clips == fixture,
+                        "Dragging the shared scrollbar did not pan both axes without editing content.")
+            for _ in 0..<30 { try await timeZoomKey(increase: false) }
+            try require(model.timeViewport.scale == 1 && model.timeViewport.start == 0 &&
+                        abs((try clipFrame(clip.id)).minX - ruler.minX) <= 1 &&
+                        abs((try clipFrame(fixture.last!.id)).maxX - ruler.maxX) <= 1,
+                        "Command-minus permits less than 100% or leaves an empty edge after fitting.")
+            try screenshot("shared-axis-minimum-100-percent")
+            record("shared-axis-command-zoom-pan-and-edit", began,
+                   "AppKit Command-plus/minus and Command-wheel on both axes shared one anchored range; pan, ruler/curve seeks and a magnified node drag stayed aligned, Undo retained view state and zoom-out/pan limits kept media filling 100% of the visible range.")
+            model.clips = original; model.selectedClipID = previousClip; model.selectedZoomID = previousZoom
+            model.seek(previousTime)
+            try model.autosave()
+            try await model.rebuildPreview()
+            await refreshDisplayedLayout()
+        }
+
+        func timeZoomKey(increase: Bool, shifted: Bool = false) async throws {
+            try await ensureActiveAndKeyWindow()
+            let modifiers: NSEvent.ModifierFlags = shifted ? [.command, .shift] : [.command]
+            for type in [NSEvent.EventType.keyDown, .keyUp] {
+                guard let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: modifiers,
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                    context: nil, characters: increase ? (shifted ? "+" : "=") : "-",
+                    charactersIgnoringModifiers: increase ? "=" : "-", isARepeat: false, keyCode: increase ? 24 : 27) else {
+                    throw failure("Cannot construct Command-plus/minus.")
+                }
+                NSApp.postEvent(event, atStart: false)
+            }
+            await settle(0.035)
+        }
+
+        func timeScroll(at point: NSPoint, vertical: Int64 = 0, horizontal: Int64 = 0, command: Bool = false) async throws {
+            try await ensureActiveAndKeyWindow()
+            // Converting a window-bound mouse event preserves its window and
+            // local coordinates in the public CGEvent -> NSEvent bridge.
+            guard let mouse = NSEvent.mouseEvent(with: .mouseMoved, location: point,
+                modifierFlags: command ? .command : [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0),
+                let cg = mouse.cgEvent else { throw failure("Cannot construct window-bound wheel input.") }
+            cg.type = .scrollWheel
+            cg.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: vertical)
+            cg.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: horizontal)
+            guard let event = NSEvent(cgEvent: cg), event.window === window, event.type == .scrollWheel else {
+                throw failure("The wheel event lost its target window.")
+            }
+            NSApp.postEvent(event, atStart: false)
+            await settle(0.09)
         }
 
         func checkTimeAxisAlignment(original: [DemoClip]) async throws {
@@ -272,7 +441,7 @@ enum EditorUISelfTest {
                 try screenshot("visible-layout-\(name)-first-endpoint")
                 let ruler = try frame("editor.timeline.ruler")
                 let graph = try frame("editor.zoomGraph")
-                let axis = EditorTimeAxisGeometry(containerWidth: graph.width)
+                let axis = EditorTimeAxisGeometry(containerWidth: graph.width, viewport: model.timeViewport)
                 try require(abs(ruler.minX - graph.minX - axis.minX) <= 1 &&
                             abs(ruler.maxX - graph.minX - axis.maxX) <= 1 &&
                             abs(ruler.minX - timelineData.minX) <= 1 && abs(ruler.maxX - timelineData.maxX) <= 1,
@@ -901,7 +1070,7 @@ enum EditorUISelfTest {
 
         func cameraGraphPoint(globalTime: Double, scale: Double) throws -> NSPoint {
             let graph = try frame("editor.zoomGraph")
-            let axis = EditorTimeAxisGeometry(containerWidth: graph.width)
+            let axis = EditorTimeAxisGeometry(containerWidth: graph.width, viewport: model.timeViewport)
             let maximum = 3.05
             return NSPoint(x: graph.minX + axis.x(at: globalTime, total: model.totalDuration),
                            y: graph.maxY - 16 - CGFloat((maximum - scale) / max(0.1, maximum - 1)) * max(1, graph.height - 16 - 18))
@@ -1960,7 +2129,7 @@ enum EditorUISelfTest {
             let previewHeight = max(220, size.height - 330)
             let timelineTop = 76 + previewHeight + 16
             let timelineWidth = size.width - 48
-            let axis = EditorTimeAxisGeometry(containerWidth: timelineWidth)
+            let axis = EditorTimeAxisGeometry(containerWidth: timelineWidth, viewport: model.timeViewport)
             let rulerWidth = axis.width
             let total = max(0.001, model.totalDuration)
             var topRect: NSRect?
@@ -2010,10 +2179,12 @@ enum EditorUISelfTest {
                 }
                 var offset = 0.0
                 for clip in model.clips {
-                    let x = 24 + axis.x(at: offset, total: total)
-                    let width = rulerWidth * clip.duration / total
+                    let originalX = 24 + axis.x(at: offset, total: total)
+                    let x = max(24 + axis.minX, originalX)
+                    let right = min(24 + axis.maxX, originalX + axis.contentWidth * clip.duration / total)
+                    let width = max(0, right - x)
                     let clipID = "editor.clip.\(clip.id.uuidString)"
-                    if identifier == clipID {
+                    if identifier == clipID, width > 0 {
                         topRect = NSRect(x: x, y: timelineTop + 31, width: width, height: 57)
                     } else if identifier == clipID + ".trim.start", model.selectedClipID == clip.id {
                         topRect = NSRect(x: x, y: timelineTop + 31, width: 12, height: 57)
