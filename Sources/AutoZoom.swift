@@ -116,6 +116,7 @@ struct ZoomPose: Sendable {
 
 /// A precomputed path makes random-access export requests deterministic.
 struct AutoZoomPlan: Sendable {
+    static let safeZoneFraction = 0.7
     let fps: Int
     let poses: [ZoomPose]
 
@@ -160,7 +161,7 @@ struct AutoZoomPlan: Sendable {
             let scale = active ? 1.6 : 1.0
             if active, let pointer {
                 let margin = 0.5 / scale
-                let deadZone = margin * 0.5
+                let deadZone = margin * Self.safeZoneFraction
                 if click { targetX = pointer.x; targetY = pointer.y }
                 else {
                     if abs(pointer.x - targetX) > deadZone { targetX = pointer.x - copysign(deadZone, pointer.x - targetX) }

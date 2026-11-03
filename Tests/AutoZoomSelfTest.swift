@@ -68,11 +68,102 @@ enum AutoZoomSelfTest {
             ]), duration: 5, fps: fps)
             try check(reentry.pose(at: 3).scale < 1.001 && reentry.pose(at: 4.5).scale > 1.59,
                       "离区重返需点击才能再次放大")
+            try checkSafeZone(fps: fps)
         }
         let saved = try JSONEncoder().encode(trace)
         try check(try JSONDecoder().decode(CursorTrace.self, from: saved).samples.count == trace.samples.count,
                   "轨迹保存错误")
         print("PASS zoom plan: offset coordinates, host time alignment, clicks, 1-second idle/outside restore, bounded crop, no-click, slow movement, jitter, reentry, 30/60fps, JSON")
+        print("PASS 70% safe zone: old-band and exact-edge hold, smooth threshold crossing, both axes/directions, in-zone clicks, bounded crop and unchanged idle timing at 30/60fps")
+    }
+
+    private static func checkSafeZone(fps: Int) throws {
+        // At 1.6x, the viewport is 0.625 wide/high. Its centered 70% region
+        // extends 0.21875 from the target; the former 50% region used 0.15625.
+        let halfSafeZone = 0.21875
+        let insideOffset = 0.1875
+        let outsideOffset = 0.25
+        let panDistance = outsideOffset - halfSafeZone
+        let alpha = 1 - exp(-1 / Double(fps) / 0.14)
+        for horizontal in [true, false] {
+            for direction in [-1.0, 1.0] {
+                let label = "\(fps)fps \(horizontal ? "X" : "Y") \(direction)"
+                func sample(_ time: Double, _ coordinate: Double, clicked: Bool = false) -> CursorSample {
+                    CursorSample(time: time, x: horizontal ? coordinate : 0.5,
+                        y: horizontal ? 0.5 : coordinate, inside: true, clicked: clicked)
+                }
+                let firstTarget = 0.5 + direction * panDistance
+                let samples = [
+                    sample(0, 0.5, clicked: true),
+                    sample(0.5, 0.5 + direction * insideOffset),
+                    sample(0.75, 0.5 + direction * halfSafeZone),
+                    sample(1, 0.5 + direction * outsideOffset),
+                    sample(1.5, firstTarget - direction * insideOffset),
+                    sample(1.75, firstTarget - direction * halfSafeZone),
+                    sample(2, firstTarget - direction * outsideOffset)
+                ]
+                let plan = AutoZoomPlan(trace: CursorTrace(samples: samples), duration: 4.5, fps: fps)
+                let held = plan.pose(at: 0.95)
+                try check(abs(held.x - 0.5) < 0.000000001 && abs(held.y - 0.5) < 0.000000001,
+                          "\(label)：旧50%外、新70%内或安全区边界意外平移")
+                var expected = 0.5
+                for index in plan.poses.indices {
+                    let target = index >= fps && index < 2 * fps ? firstTarget : 0.5
+                    expected += (target - expected) * alpha
+                    let pose = plan.poses[index]
+                    let actual = horizontal ? pose.x : pose.y
+                    let otherAxis = horizontal ? pose.y : pose.x
+                    try check(abs(actual - expected) < 0.000000001 && abs(otherAxis - 0.5) < 0.000000001,
+                              "\(label)：越过70%后的平移、反向安全区或原有平滑速度不正确")
+                }
+                let firstPan = plan.poses[fps]
+                let firstCoordinate = horizontal ? firstPan.x : firstPan.y
+                let firstDistance = (firstCoordinate - 0.5) * direction
+                try check(firstDistance > 0 && firstDistance < panDistance,
+                          "\(label)：越界后应平滑移动，不能立即跳到新中心")
+                try check(plan.pose(at: 2.9).scale > 1.59 && plan.pose(at: 3.35).scale < 1.08 &&
+                          plan.pose(at: 4.2).scale < 1.001,
+                          "\(label)：放大持续时间应仍为最后一次活动后1秒，再平滑回全景")
+                try checkBounded(plan, label: label)
+
+                let clicked = AutoZoomPlan(trace: CursorTrace(samples: [
+                    sample(0, 0.5, clicked: true),
+                    sample(0.5, 0.5 + direction * 0.125, clicked: true)
+                ]), duration: 3, fps: fps)
+                let clickedPose = clicked.poses[fps / 2]
+                let clickedCoordinate = horizontal ? clickedPose.x : clickedPose.y
+                let clickExpected = 0.5 + direction * 0.125 * alpha
+                try check(abs(clickedCoordinate - clickExpected) < 0.000000001,
+                          "\(label)：安全区内点击也应立即重新聚焦，并保留平滑过渡")
+                let focused = clicked.pose(at: 1.2)
+                let focusedCoordinate = horizontal ? focused.x : focused.y
+                try check(abs(focusedCoordinate - (0.5 + direction * 0.125)) < 0.001,
+                          "\(label)：安全区内点击被错误当作无需跟随")
+                try checkBounded(clicked, label: label + " click")
+            }
+        }
+        let corners = CursorTrace(samples: [
+            CursorSample(time: 0, x: 0.5, y: 0.5, inside: true, clicked: true),
+            CursorSample(time: 0.5, x: 0.999, y: 0.999, inside: true, clicked: false),
+            CursorSample(time: 1, x: 0.001, y: 0.001, inside: true, clicked: false),
+            CursorSample(time: 1.5, x: 0.999, y: 0.999, inside: true, clicked: true),
+            CursorSample(time: 2, x: 1.2, y: -0.2, inside: false, clicked: false)
+        ])
+        let boundary = AutoZoomPlan(trace: corners, duration: 4, fps: fps)
+        try checkBounded(boundary, label: "\(fps)fps corners")
+        try check(boundary.pose(at: 1.9).x > 0.65 && boundary.pose(at: 1.9).y > 0.65 &&
+                  boundary.pose(at: 3.5).scale < 1.001,
+                  "\(fps)fps：边缘点击应受录制边界限制，离区后仍需恢复全景")
+    }
+
+    private static func checkBounded(_ plan: AutoZoomPlan, label: String) throws {
+        for pose in plan.poses {
+            let viewport = pose.viewport
+            let insideX = viewport.minX >= -0.000000001 && viewport.maxX <= 1.000000001
+            let insideY = viewport.minY >= -0.000000001 && viewport.maxY <= 1.000000001
+            try check(insideX && insideY && pose.scale >= 1 && pose.scale <= 1.600000001,
+                      "\(label)：70%安全区跟随越出录制范围或改变了放大倍率")
+        }
     }
 
     static func run(directory: URL) async throws {
