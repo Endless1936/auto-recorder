@@ -17,7 +17,7 @@ removing quarantine or installing developer tools. Report the version and
 installation path. If you cannot operate this Mac, say so honestly.
 ```
 
-[Manual download v2.3.4](https://github.com/Endless1936/auto-recorder/releases/download/v2.3.4/Auto-Recorder-v2.3.4-macos-arm64.dmg) · [中文](README.md)
+[Manual download v2.4.0](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.0/Auto-Recorder-v2.4.0-macos-arm64.dmg) · [中文](README.md)
 
 Local Mac screen recording with automatic zoom and simple cuts. Apple Silicon, macOS 15+, Chinese UI.
 
