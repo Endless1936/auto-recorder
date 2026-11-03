@@ -61,14 +61,16 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     var manualCenterPath: [ZoomCenterPoint]?
     var cameraKeyframes: [CameraKeyframe]?
     var centerOffsets: [CameraCenterOffset]?
+    var centerPanSpans: [CameraPanSpan]?
 
     init(id: UUID = UUID(), start: Double = 1, riseEnd: Double = 2,
          fallStart: Double = 8, end: Double = 9, peak: Double = 1.6,
          focusX: Double = 0.56, focusY: Double = 0.48,
          centerPath: [ZoomCenterPoint] = [], manualFocus: Bool = false,
          manualCenterPath: [ZoomCenterPoint]? = nil,
-          cameraKeyframes: [CameraKeyframe]? = nil,
-          centerOffsets: [CameraCenterOffset]? = nil) {
+         cameraKeyframes: [CameraKeyframe]? = nil,
+         centerOffsets: [CameraCenterOffset]? = nil,
+         centerPanSpans: [CameraPanSpan]? = nil) {
         self.id = id; self.start = start; self.riseEnd = riseEnd
         self.fallStart = fallStart; self.end = end; self.peak = peak
         self.focusX = focusX; self.focusY = focusY
@@ -76,6 +78,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         self.manualCenterPath = manualCenterPath
         self.cameraKeyframes = cameraKeyframes
         self.centerOffsets = centerOffsets
+        self.centerPanSpans = centerPanSpans
     }
 
     static func standard(duration: Double, peak: Double = 1.6) -> ZoomSegment {
@@ -121,7 +124,8 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
 
     var preferredFramingSampleTimes: [Double] {
         let times = centerPath.map(\.time) + (manualCenterPath ?? []).map(\.time) +
-            cameraControlPoints.map(\.time) + (centerOffsets ?? []).map(\.time)
+            cameraControlPoints.map(\.time) + (centerOffsets ?? []).map(\.time) +
+            (centerPanSpans ?? []).flatMap { [$0.start, $0.end] }
         return Array(Set(times.filter(\.isFinite))).sorted()
     }
 
@@ -149,12 +153,16 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     mutating func addCameraKeyframe(at time: Double, tolerance: Double = 0.000001) -> CameraKeyframe? {
         guard time.isFinite, time >= start, time <= end else { return nil }
         enableCameraKeyframes()
-        if let existing = cameraKeyframes?.first(where: { abs($0.time - time) <= tolerance }) { return existing }
+        if let existing = cameraKeyframes?.first(where: { abs($0.time - time) <= tolerance }) {
+            splitCenterPans(at: existing.time)
+            return existing
+        }
         let offset = !manualFocus && !centerPath.isEmpty && !(centerOffsets ?? []).isEmpty ? centerOffset(at: time) : nil
         let point = CameraKeyframe(time: time, scale: scale(at: time), slope: scaleDerivative(at: time))
         cameraKeyframes?.append(point)
         cameraKeyframes?.sort { $0.time < $1.time }
         if let offset { storeCenterOffset(offset) }
+        splitCenterPans(at: time)
         return point
     }
 
@@ -167,8 +175,17 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         func gap(in available: Double) -> Double {
             min(available, max(0.0000011, min(preferredGap, available / 2)))
         }
-        let lower = index > 0 ? points[index - 1].time + gap(in: oldTime - points[index - 1].time) : -Double.greatestFiniteMagnitude
-        let upper = index + 1 < points.count ? points[index + 1].time - gap(in: points[index + 1].time - oldTime) : Double.greatestFiniteMagnitude
+        var lower = index > 0 ? points[index - 1].time + gap(in: oldTime - points[index - 1].time) : -Double.greatestFiniteMagnitude
+        var upper = index + 1 < points.count ? points[index + 1].time - gap(in: points[index + 1].time - oldTime) : Double.greatestFiniteMagnitude
+        if let spans = centerPanSpans, spans.contains(where: { $0.start <= oldTime && oldTime <= $0.end }) {
+            let boundaries = spans.flatMap { [$0.start, $0.end] }
+            if let previous = boundaries.filter({ $0 < oldTime - 0.000001 }).max() {
+                lower = max(lower, previous + gap(in: oldTime - previous))
+            }
+            if let next = boundaries.filter({ $0 > oldTime + 0.000001 }).min() {
+                upper = min(upper, next - gap(in: next - oldTime))
+            }
+        }
         let nextTime = min(upper, max(lower, time))
         points[index].time = nextTime
         points[index].scale = index == 0 || index == points.count - 1 ? 1 : min(3, max(1, scale))
@@ -183,6 +200,8 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
 
     private mutating func moveCenterControl(from oldTime: Double, to newTime: Double) {
         let value = pose(at: oldTime)
+        splitCenterPans(at: oldTime)
+        moveCenterPanEndpoints(from: oldTime, to: newTime, x: value.x, y: value.y)
         if !manualFocus, !centerPath.isEmpty {
             let offset = centerOffset(at: oldTime)
             let base = interpolatedCenter(in: centerPath, at: newTime)
@@ -206,15 +225,96 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         let removed = points.dropFirst().dropLast().filter { ids.contains($0.id) }
         guard !removed.isEmpty else { return }
         let removedIDs = Set(removed.map(\.id))
+        var replacementSpans: [CameraPanSpan] = []
+        var index = 1
+        while index < points.count - 1 {
+            guard removedIDs.contains(points[index].id) else { index += 1; continue }
+            let left = index - 1
+            while index < points.count - 1, removedIDs.contains(points[index].id) { index += 1 }
+            let a = points[left].time, b = points[index].time
+            let first = pose(at: a), last = pose(at: b)
+            replacementSpans.append(CameraPanSpan(start: a, end: b, startX: first.x, startY: first.y,
+                endX: last.x, endY: last.y))
+        }
         cameraKeyframes = points.filter { !removedIDs.contains($0.id) }
         centerOffsets?.removeAll { offset in removed.contains(where: { abs($0.time - offset.time) < 0.000001 }) }
         if centerOffsets?.isEmpty == true { centerOffsets = nil }
-        manualCenterPath?.removeAll { point in removed.contains(where: { abs($0.time - point.time) < 0.000001 }) }
-        if manualCenterPath?.isEmpty == true { manualCenterPath = nil }
+        for span in replacementSpans { replaceCenterPan(with: span) }
         if let controls = cameraKeyframes {
             start = controls[0].time; end = controls[controls.count - 1].time
             peak = controls.map(\.scale).max() ?? 1
         }
+    }
+
+    mutating func removeFramingCenter(at time: Double) {
+        guard time.isFinite, time > start + 0.000001, time < end - 0.000001 else { return }
+        let times = sortedMotionTimes(framingKeyframes.map(\.time) + (centerOffsets ?? []).map(\.time) + [start, end])
+        guard let previous = times.filter({ $0 < time - 0.000001 }).last,
+              let next = times.first(where: { $0 > time + 0.000001 }) else { return }
+        let first = pose(at: previous), last = pose(at: next)
+        centerOffsets?.removeAll { abs($0.time - time) < 0.000001 }
+        if centerOffsets?.isEmpty == true { centerOffsets = nil }
+        replaceCenterPan(with: CameraPanSpan(start: previous, end: next, startX: first.x, startY: first.y,
+            endX: last.x, endY: last.y))
+    }
+
+    private mutating func replaceCenterPan(with replacement: CameraPanSpan) {
+        guard replacement.end > replacement.start else { return }
+        var spans: [CameraPanSpan] = []
+        for span in centerPanSpans ?? [] {
+            if span.end <= replacement.start || span.start >= replacement.end { spans.append(span); continue }
+            if let left = span.trimmed(from: span.start, to: replacement.start) { spans.append(left) }
+            if let right = span.trimmed(from: replacement.end, to: span.end) { spans.append(right) }
+        }
+        spans.append(replacement)
+        centerPanSpans = spans.sorted { $0.start < $1.start }
+    }
+
+    private mutating func splitCenterPans(at time: Double) {
+        guard let current = centerPanSpans else { return }
+        var spans: [CameraPanSpan] = []
+        for span in current {
+            if time > span.start + 0.000000001, time < span.end - 0.000000001,
+               let left = span.trimmed(from: span.start, to: time),
+               let right = span.trimmed(from: time, to: span.end) {
+                spans += [left, right]
+            } else { spans.append(span) }
+        }
+        centerPanSpans = spans
+    }
+
+    private mutating func updateCenterPanEndpoints(at time: Double, x: Double, y: Double) {
+        guard var spans = centerPanSpans else { return }
+        for index in spans.indices {
+            var changed = false
+            if abs(spans[index].start - time) < 0.000001,
+               abs(spans[index].startX - x) > 0.000000001 || abs(spans[index].startY - y) > 0.000000001 {
+                spans[index].startX = x; spans[index].startY = y; changed = true
+            }
+            if abs(spans[index].end - time) < 0.000001,
+               abs(spans[index].endX - x) > 0.000000001 || abs(spans[index].endY - y) > 0.000000001 {
+                spans[index].endX = x; spans[index].endY = y; changed = true
+            }
+            if changed { spans[index].useSmoothstepTiming() }
+        }
+        centerPanSpans = spans
+    }
+
+    private mutating func moveCenterPanEndpoints(from oldTime: Double, to newTime: Double, x: Double, y: Double) {
+        guard var spans = centerPanSpans else { return }
+        for index in spans.indices {
+            var changed = false
+            if abs(spans[index].start - oldTime) < 0.000001 {
+                spans[index].start = newTime; spans[index].startX = x; spans[index].startY = y; changed = true
+            }
+            if abs(spans[index].end - oldTime) < 0.000001 {
+                spans[index].end = newTime; spans[index].endX = x; spans[index].endY = y; changed = true
+            }
+            if changed { spans[index].useSmoothstepTiming() }
+        }
+        centerPanSpans = spans
+        splitCenterPans(at: newTime)
+        updateCenterPanEndpoints(at: newTime, x: x, y: y)
     }
 
     func hasSameContent(as other: ZoomSegment) -> Bool {
@@ -237,6 +337,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         result.manualCenterPath = manualCenterPath?.map { ZoomCenterPoint(time: $0.time + offset, x: $0.x, y: $0.y) }
         result.cameraKeyframes = cameraKeyframes?.map { var point = $0; point.time += offset; return point }
         result.centerOffsets = centerOffsets?.map { var point = $0; point.time += offset; return point }
+        result.centerPanSpans = centerPanSpans?.map { var span = $0; span.start += offset; span.end += offset; return span }
         return result
     }
 
@@ -280,7 +381,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
 
     func pose(at time: Double) -> DemoZoomPose {
         let scale = self.scale(at: time)
-        let center: (Double, Double)
+        var center: (Double, Double)
         if let path = manualCenterPath, !path.isEmpty, manualFocus || centerPath.isEmpty {
             center = interpolatedCenter(in: path, at: time, eased: true)
         } else if manualFocus || centerPath.isEmpty {
@@ -292,6 +393,10 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
                 let correction = centerOffset(at: time)
                 center = (base.0 + correction.x, base.1 + correction.y)
             } else { center = base }
+        }
+        if let pan = centerPanSpans?.first(where: { $0.start <= time && time <= $0.end }) {
+            let value = pan.sample(at: time)
+            center = (value.x, value.y)
         }
         let margin = 0.5 / scale
         return DemoZoomPose(scale: scale,
@@ -307,10 +412,13 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             }
         }
         if manualFocus || centerPath.isEmpty {
-            return manualCenterPath ?? [ZoomCenterPoint(time: start, x: 0.5, y: 0.5),
+            let points = manualCenterPath ?? [ZoomCenterPoint(time: start, x: 0.5, y: 0.5),
                 ZoomCenterPoint(time: riseEnd, x: focusX, y: focusY),
                 ZoomCenterPoint(time: fallStart, x: focusX, y: focusY),
                 ZoomCenterPoint(time: end, x: 0.5, y: 0.5)]
+            return points.filter { point in
+                !(centerPanSpans ?? []).contains(where: { point.time > $0.start + 0.000001 && point.time < $0.end - 0.000001 })
+            }
         }
         return centerPath
     }
@@ -322,11 +430,14 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             let margin = 0.5 / scale(at: anchor.time)
             let base = interpolatedCenter(in: centerPath, at: anchor.time)
             let previous = centerOffset(at: anchor.time)
-            storeCenterOffset(CameraCenterOffset(time: anchor.time, x: min(1 - margin, max(margin, x)) - base.0,
-                y: min(1 - margin, max(margin, y)) - base.1, slopeX: previous.slopeX, slopeY: previous.slopeY))
+            let centerX = min(1 - margin, max(margin, x)), centerY = min(1 - margin, max(margin, y))
+            storeCenterOffset(CameraCenterOffset(time: anchor.time, x: centerX - base.0,
+                y: centerY - base.1, slopeX: previous.slopeX, slopeY: previous.slopeY))
+            updateCenterPanEndpoints(at: anchor.time, x: centerX, y: centerY)
             return
         }
         if cameraKeyframes != nil { _ = addCameraKeyframe(at: time) }
+        splitCenterPans(at: time)
         let margin = 0.5 / scale(at: time)
         let point = ZoomCenterPoint(time: time, x: min(1 - margin, max(margin, x)),
                                     y: min(1 - margin, max(margin, y)))
@@ -342,6 +453,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             path.sort { $0.time < $1.time }
         }
         manualCenterPath = path
+        updateCenterPanEndpoints(at: time, x: point.x, y: point.y)
     }
 
     private mutating func storeCenterOffset(_ point: CameraCenterOffset) {
@@ -441,6 +553,14 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
                 points.append(point)
             }
             result.centerOffsets = points.isEmpty ? nil : points
+        }
+        if let raw = result.centerPanSpans {
+            var spans: [CameraPanSpan] = []
+            for span in raw.filter({ $0.isFinite && $0.end > $0.start }).sorted(by: { $0.start < $1.start }) {
+                let lower = max(span.start, spans.last?.end ?? span.start)
+                if let part = span.trimmed(from: lower, to: span.end) { spans.append(part) }
+            }
+            result.centerPanSpans = spans.isEmpty ? nil : spans
         }
         return result
     }
@@ -793,6 +913,86 @@ final class EditorModel: ObservableObject {
     }
     var projectTitle: String { projectURL?.lastPathComponent ?? "录屏工程" }
     var hasProject: Bool { project != nil }
+
+    private struct CameraNavigationLocation {
+        let time: Double
+        let clipID: UUID
+        let zoomID: UUID?
+        let anchorID: UUID?
+    }
+
+    private struct CameraNavigationTarget {
+        let time: Double
+        var locations: [CameraNavigationLocation]
+    }
+
+    private static let cameraNavigationTolerance = 0.000001
+
+    private var cameraNavigationTargets: [CameraNavigationTarget] {
+        guard totalDuration.isFinite, totalDuration >= 0 else { return [] }
+        var locations: [CameraNavigationLocation] = []
+        var offset = 0.0
+        for clip in clips {
+            guard clip.duration.isFinite, clip.duration >= 0 else { return [] }
+            locations.append(CameraNavigationLocation(time: offset, clipID: clip.id, zoomID: nil, anchorID: nil))
+            for zoom in clip.zooms {
+                for point in zoom.cameraControlPoints where point.time.isFinite && point.time >= 0 && point.time <= clip.duration {
+                    locations.append(CameraNavigationLocation(time: offset + point.time,
+                        clipID: clip.id, zoomID: zoom.id, anchorID: point.id))
+                }
+            }
+            offset += clip.duration
+            locations.append(CameraNavigationLocation(time: offset, clipID: clip.id, zoomID: nil, anchorID: nil))
+        }
+        let ordered = locations.enumerated().sorted {
+            $0.element.time == $1.element.time ? $0.offset < $1.offset : $0.element.time < $1.element.time
+        }.map(\.element)
+        var targets: [CameraNavigationTarget] = []
+        for location in ordered {
+            if let last = targets.indices.last,
+               location.time - targets[last].time <= Self.cameraNavigationTolerance {
+                targets[last].locations.append(location)
+            } else {
+                targets.append(CameraNavigationTarget(time: location.time, locations: [location]))
+            }
+        }
+        return targets.map { target in
+            let time = target.locations.first(where: { $0.anchorID == nil })?.time ?? target.time
+            return CameraNavigationTarget(time: time, locations: target.locations)
+        }
+    }
+
+    var cameraNavigationTimes: [Double] { cameraNavigationTargets.map(\.time) }
+
+    /// The preview and curve share one chronological list, including full-view
+    /// controls and clip boundaries. Navigation never edits camera data/history.
+    @discardableResult
+    func navigateCameraTarget(forward: Bool) -> Bool {
+        guard !isExporting, !isLoading, editingSnapshot == nil, playhead.isFinite else { return false }
+        isPlaying = false
+        let targets = cameraNavigationTargets
+        let target = forward
+            ? targets.first(where: { $0.time > playhead + Self.cameraNavigationTolerance })
+            : targets.last(where: { $0.time < playhead - Self.cameraNavigationTolerance })
+        guard let target else { return false }
+        let ownerID = position(at: target.time).map { clips[$0.index].id }
+        let visibleLocations = target.locations.filter { $0.clipID == ownerID }
+        let locations = visibleLocations.isEmpty ? target.locations : visibleLocations
+        let nodes = locations.filter { $0.anchorID != nil }
+        let location = nodes.first(where: { $0.clipID == selectedClipID && $0.zoomID == selectedZoomID }) ??
+            nodes.first(where: { $0.clipID == selectedClipID }) ?? nodes.first ?? locations.first!
+        selectedClipID = location.clipID
+        selectedZoomID = location.zoomID
+        selectedMotionPointTime = nil
+        if let id = location.anchorID {
+            editingSelectionTarget = .cameraAnchors
+            selectedCameraAnchorIDs = [id]
+        } else {
+            enterClipSelection()
+        }
+        seek(target.time)
+        return true
+    }
 
     var canDeleteSelection: Bool {
         guard !isExporting else { return false }
@@ -1331,19 +1531,10 @@ final class EditorModel: ObservableObject {
                 ? "先选择要删除的取景锚点" : "首尾全景锚点不能删除"
             return false
         }
-        var removedTimes: [Double] = motionTime.map { [$0] } ?? []
         if !ids.isEmpty {
-            removedTimes += zoom.cameraControlPoints.filter { ids.contains($0.id) }.map(\.time)
             zoom.removeCameraKeyframes(ids: ids)
         }
-        if var offsets = zoom.centerOffsets {
-            offsets.removeAll { point in removedTimes.contains(where: { abs($0 - point.time) < 0.000001 }) }
-            zoom.centerOffsets = offsets.isEmpty ? nil : offsets
-        }
-        if var path = zoom.manualCenterPath {
-            path.removeAll { point in removedTimes.contains(where: { abs($0 - point.time) < 0.000001 }) }
-            zoom.manualCenterPath = path.isEmpty ? nil : path
-        }
+        if let motionTime { zoom.removeFramingCenter(at: motionTime) }
         setZoom(zoom, for: clip.id)
         clearCameraAnchorSelection()
         message = "已删除取景锚点"
@@ -1644,6 +1835,7 @@ final class EditorModel: ObservableObject {
         zoom.focusX = x; zoom.focusY = y; zoom.manualFocus = true
         zoom.manualCenterPath = nil
         zoom.centerOffsets = nil
+        zoom.centerPanSpans = nil
         setZoom(zoom, for: clip.id)
     }
 

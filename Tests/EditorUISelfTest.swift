@@ -205,6 +205,7 @@ enum EditorUISelfTest {
             try await checkAutomaticCircularPath(original: focusable, irregular: true)
             try await checkCameraCurveSelection(original: focusable)
             try await checkTargetAwareDelete(original: focusable)
+            try await checkCameraTargetNavigation(original: focusable)
             if addedZoom {
                 try await undo()
                 try require(model.clips == original, "One Command-Z did not remove the UI-created test zoom.")
@@ -1022,8 +1023,10 @@ enum EditorUISelfTest {
                         model.totalDuration == duration && model.sourceURL == sourceURL && model.projectURL == projectURL,
                         "Deleting a path badge modified the clip, media reference or timeline duration.")
             try require(afterNodeDelete.cameraControlPoints == controls.filter { $0.id != controls[2].id } &&
-                        afterNodeDelete.manualCenterPath == centers.filter { abs($0.time - controls[2].time) > 0.000001 },
-                        "Delete did not remove only the selected camera node and its matching position point.")
+                        afterNodeDelete.manualCenterPath == centers &&
+                        !afterNodeDelete.framingKeyframes.contains(where: { abs($0.time - controls[2].time) < 0.000001 }),
+                        "Delete did not remove its visible node while retaining the original movement data.")
+            try requireStraightPan(afterNodeDelete, before: zoom, from: controls[1].time, to: controls[3].time)
             let savedNodeDelete = try persistedClips()
             try require(savedNodeDelete == model.clips && model.player.currentItem === previewItem,
                         "Deleting a camera anchor did not save or unnecessarily reloaded raw video.")
@@ -1087,8 +1090,9 @@ enum EditorUISelfTest {
             }
             try require(model.clips.count == 1 && model.totalDuration == duration &&
                         afterGroupDelete.cameraControlPoints == controls.filter { !deletedIDs.contains($0.id) } &&
-                        afterGroupDelete.manualCenterPath == centers.filter { abs($0.time - controls[1].time) > 0.000001 && abs($0.time - controls[2].time) > 0.000001 },
+                        afterGroupDelete.manualCenterPath == centers,
                         "Preview trash did not delete only the marquee-selected camera nodes in a one-clip project.")
+            try requireStraightPan(afterGroupDelete, before: zoom, from: controls[0].time, to: controls[3].time)
             let savedGroupDelete = try persistedClips()
             try require(savedGroupDelete == model.clips && model.player.currentItem === previewItem,
                         "Deleting a camera-node group did not save or reloaded its raw video.")
@@ -1133,6 +1137,10 @@ enum EditorUISelfTest {
                         afterSampleDelete.cameraControlPoints == legacyZoom.cameraControlPoints.filter { $0.id != sampledControl.id } &&
                         afterSampleDelete.centerPath == legacyPath,
                         "Deleting an automatic camera control changed retained source samples, duration, clip count or unrelated controls.")
+            let sampledIndex = legacyZoom.cameraControlPoints.firstIndex { $0.id == sampledControl.id }!
+            try requireStraightPan(afterSampleDelete, before: legacyZoom,
+                from: legacyZoom.cameraControlPoints[sampledIndex - 1].time,
+                to: legacyZoom.cameraControlPoints[sampledIndex + 1].time)
             let savedSampleDelete = try persistedClips()
             try require(savedSampleDelete == model.clips && model.player.currentItem === previewItem,
                         "Deleting a sampled movement point failed to save or reloaded raw video.")
@@ -1198,6 +1206,106 @@ enum EditorUISelfTest {
             try await model.rebuildPreview()
             await refreshDisplayedLayout()
             try require(model.clips == original, "Target-aware Delete fixtures left edits behind.")
+        }
+
+        func requireStraightPan(_ zoom: ZoomSegment, before: ZoomSegment, from lower: Double, to upper: Double) throws {
+            let a = before.pose(at: lower), b = before.pose(at: upper)
+            let dx = b.x - a.x, dy = b.y - a.y, length = dx * dx + dy * dy
+            var previous = -0.0000001
+            for fraction in stride(from: 0.0, through: 1.0, by: 0.02) {
+                let pose = zoom.pose(at: lower + (upper - lower) * fraction)
+                let x = pose.x - a.x, y = pose.y - a.y
+                let progress = length > 0.000000001 ? (x * dx + y * dy) / length : 0
+                try require(abs(x * dy - y * dx) < 0.000001 && progress >= previous - 0.000001 &&
+                            progress >= -0.000001 && progress <= 1.000001,
+                            "Native node deletion did not replace its surviving neighbors' route with one straight, forward pan.")
+                previous = progress
+            }
+        }
+
+        func checkCameraTargetNavigation(original: [DemoClip]) async throws {
+            guard original.count >= 2, original[0].duration > 0.2, original[1].duration > 0.2 else {
+                throw failure("Camera navigation requires two nonempty source clips.")
+            }
+            let began = Date()
+            let previousClipID = model.selectedClipID, previousZoomID = model.selectedZoomID
+            let previousTime = model.playhead
+            var fixture = original
+            for index in fixture.indices { fixture[index].zooms = [] }
+            func zoom(duration: Double) -> ZoomSegment {
+                let controls = [CameraKeyframe(time: 0, scale: 1), CameraKeyframe(time: duration * 0.25, scale: 1.6),
+                    CameraKeyframe(time: duration * 0.6, scale: 1.6), CameraKeyframe(time: duration, scale: 1)]
+                return ZoomSegment(start: 0, riseEnd: duration * 0.25, fallStart: duration * 0.6,
+                    end: duration, peak: 1.6, manualFocus: true, cameraKeyframes: controls).normalized()
+            }
+            let firstZoom = zoom(duration: fixture[0].duration), secondZoom = zoom(duration: fixture[1].duration)
+            let firstControls = firstZoom.cameraControlPoints, secondControls = secondZoom.cameraControlPoints
+            fixture[0].zooms = [firstZoom]; fixture[1].zooms = [secondZoom]
+            model.clips = fixture
+            model.selectedClipID = fixture[0].id; model.selectedZoomID = firstZoom.id
+            model.seek(fixture[0].duration * 0.125)
+            try model.autosave()
+            try await model.rebuildPreview()
+            await refreshDisplayedLayout()
+            try require(!model.showsFramingOverlay, "Camera navigation should be tested with framing assistance off.")
+            guard let folder = model.projectURL else { throw failure("Camera navigation has no project folder.") }
+            let jsonURL = folder.appendingPathComponent("project.json")
+            let jsonBefore = try Data(contentsOf: jsonURL)
+            let canUndoBefore = model.canUndo
+            window.makeFirstResponder(window.contentView)
+            try await arrowKey(forward: true)
+            try require(abs(model.playhead - firstControls[1].time) < 0.000001 && model.selectedClipID == fixture[0].id &&
+                        model.selectedCameraAnchorIDs == [firstControls[1].id] && model.editingSelectionTarget == .cameraAnchors,
+                        "Native Down did not select and seek the nearest camera node with framing assistance off.")
+            try await arrowKey(forward: false)
+            try require(model.playhead == 0, "Native Up did not seek the preceding protected start node.")
+            try await arrowKey(forward: false)
+            try require(model.playhead == 0, "Native Up looped from the first target.")
+            for target in [firstControls[1].time, firstControls[2].time, fixture[0].duration,
+                           fixture[0].duration + secondControls[1].time] {
+                try await arrowKey(forward: true)
+                try require(abs(model.playhead - target) < 0.000001 && model.selectedClipID == model.activeClip?.id,
+                            "Native Down repeated/skipped a global target or selected a clip different from the displayed frame.")
+                if abs(target - fixture[0].duration) < 0.000001 {
+                    try require(model.selectedClipID == fixture[1].id &&
+                                model.selectedCameraAnchorIDs == [secondControls[0].id],
+                                "Join navigation selected the preceding clip's end instead of the following clip's displayed start node.")
+                }
+            }
+            try require(model.selectedClipID == fixture[1].id && model.selectedZoomID == secondZoom.id &&
+                        model.selectedCameraAnchorIDs == [secondControls[1].id],
+                        "Cross-clip keyboard navigation did not synchronize camera selection.")
+            let modifierTime = model.playhead, modifierSelection = model.selectedCameraAnchorIDs
+            try await arrowKey(forward: false, modifiers: .shift)
+            try require(model.playhead == modifierTime && model.selectedCameraAnchorIDs == modifierSelection,
+                        "Shift plus an arrow key triggered plain camera navigation.")
+            do {
+                guard let content = window.contentView else { throw failure("Navigation text check has no content view.") }
+                let previousResponder = window.firstResponder
+                let field = NSTextField(frame: NSRect(x: 40, y: 40, width: 140, height: 24))
+                field.isEditable = true; field.isSelectable = true; field.stringValue = "AB"
+                content.addSubview(field)
+                defer { window.makeFirstResponder(previousResponder); field.removeFromSuperview() }
+                try require(window.makeFirstResponder(field), "Navigation text field could not become first responder.")
+                field.selectText(nil)
+                let timeBefore = model.playhead, selectionBefore = model.selectedCameraAnchorIDs
+                try await arrowKey(forward: false)
+                try require(model.playhead == timeBefore && model.selectedCameraAnchorIDs == selectionBefore,
+                            "Arrow key in an editable text field navigated the video.")
+            }
+            model.seek(model.totalDuration)
+            try await arrowKey(forward: true)
+            try require(model.playhead == model.totalDuration && model.clips == fixture && model.canUndo == canUndoBefore &&
+                        (try Data(contentsOf: jsonURL)) == jsonBefore,
+                        "Native navigation looped, edited content, created Undo or rewrote project JSON.")
+            record("keyboard-global-camera-target-navigation", began,
+                   "Native Up/Down sought and selected chronological camera nodes across clip boundaries with assistance off, deduplicated joins, clamped endpoints, respected text editing and left source data/JSON/Undo unchanged.")
+            model.clips = original; model.selectedClipID = previousClipID; model.selectedZoomID = previousZoomID
+            model.seek(previousTime)
+            try model.autosave()
+            try await model.rebuildPreview()
+            await refreshDisplayedLayout()
+            try require(model.clips == original, "Camera navigation fixture left edits behind.")
         }
 
         func cameraHandleIdentifier(at time: Double) throws -> String {
@@ -1317,6 +1425,24 @@ enum EditorUISelfTest {
             }
             events.append(["action": "keyboard", "key": forward ? "Forward Delete" : "Delete", "isActive": "\(NSApp.isActive)",
                            "isKeyWindow": "\(window.isKeyWindow)", "editingSelectionTarget": "\(model.editingSelectionTarget)"])
+            await settle(0.16)
+        }
+
+        func arrowKey(forward: Bool, modifiers: NSEvent.ModifierFlags = []) async throws {
+            try await ensureActiveAndKeyWindow()
+            try requireInputFocus()
+            let now = ProcessInfo.processInfo.systemUptime
+            let character = forward ? "\u{f701}" : "\u{f700}"
+            for type in [NSEvent.EventType.keyDown, .keyUp] {
+                guard let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: modifiers,
+                    timestamp: now, windowNumber: window.windowNumber, context: nil, characters: character,
+                    charactersIgnoringModifiers: character, isARepeat: false, keyCode: forward ? 125 : 126) else {
+                    throw failure("Could not construct native arrow-key events.")
+                }
+                NSApp.postEvent(event, atStart: false)
+            }
+            events.append(["action": "keyboard", "key": forward ? "Down" : "Up", "modifiers": "\(modifiers.rawValue)", "isActive": "\(NSApp.isActive)",
+                           "isKeyWindow": "\(window.isKeyWindow)"])
             await settle(0.16)
         }
 

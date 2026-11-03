@@ -9,6 +9,48 @@ struct CameraCenterOffset: Codable, Equatable, Sendable {
     var slopeY: Double? = nil
 }
 
+/// An authored absolute pan overlays the retained route only inside this span.
+struct CameraPanSpan: Codable, Equatable, Sendable {
+    var start: Double
+    var end: Double
+    var startX: Double
+    var startY: Double
+    var endX: Double
+    var endY: Double
+    var startSlopeX: Double = 0
+    var startSlopeY: Double = 0
+    var endSlopeX: Double = 0
+    var endSlopeY: Double = 0
+
+    func sample(at time: Double) -> CameraCenterOffset {
+        let span = end - start
+        guard span > 0 else { return CameraCenterOffset(time: time, x: startX, y: startY) }
+        let t = min(1, max(0, (time - start) / span))
+        return CameraCenterOffset(time: time,
+            x: CameraMotion.hermite(startX, endX, startSlopeX, endSlopeX, span, t),
+            y: CameraMotion.hermite(startY, endY, startSlopeY, endSlopeY, span, t),
+            slopeX: CameraMotion.hermiteDerivative(startX, endX, startSlopeX, endSlopeX, span, t),
+            slopeY: CameraMotion.hermiteDerivative(startY, endY, startSlopeY, endSlopeY, span, t))
+    }
+
+    func trimmed(from lower: Double, to upper: Double) -> CameraPanSpan? {
+        let a = max(start, lower), b = min(end, upper)
+        guard b - a > 0.000000001 else { return nil }
+        let first = sample(at: a), last = sample(at: b)
+        return CameraPanSpan(start: a, end: b, startX: first.x, startY: first.y,
+            endX: last.x, endY: last.y, startSlopeX: first.slopeX ?? 0, startSlopeY: first.slopeY ?? 0,
+            endSlopeX: last.slopeX ?? 0, endSlopeY: last.slopeY ?? 0)
+    }
+
+    var isFinite: Bool {
+        [start, end, startX, startY, endX, endY, startSlopeX, startSlopeY, endSlopeX, endSlopeY].allSatisfy(\.isFinite)
+    }
+
+    mutating func useSmoothstepTiming() {
+        startSlopeX = 0; startSlopeY = 0; endSlopeX = 0; endSlopeY = 0
+    }
+}
+
 struct CameraMotionSample: Sendable {
     var time: Double
     var x: Double

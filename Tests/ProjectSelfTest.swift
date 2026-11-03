@@ -136,6 +136,8 @@ enum ProjectSelfTest {
     static func runLogic() throws {
         try checkCameraKeyframes()
         try checkAutomaticMotionLogic()
+        try checkDeletedMotionSpans()
+        try checkCameraTargetNavigation()
         try checkCameraAnchorDragging()
         try checkCameraSelectionDeletion()
         try checkFramingPaths()
@@ -401,6 +403,147 @@ enum ProjectSelfTest {
         print("PASS automatic motion: circular/irregular paths, stable chronological controls, exact no-op insertion before/after edits, smooth local correction, immutable base, linked time move/delete, persistence and shifted cuts")
     }
 
+    private static func checkDeletedMotionSpans() throws {
+        let path = (0...240).map { index -> ZoomCenterPoint in
+            let time = Double(index) / 30
+            let angle = (time - 1) * .pi / 3
+            return ZoomCenterPoint(time: time, x: 0.5 + 0.15 * cos(angle), y: 0.5 + 0.11 * sin(angle))
+        }
+        let controls = (0...8).map { CameraKeyframe(time: Double($0), scale: $0 == 0 || $0 == 8 ? 1 : 2) }
+        let original = ZoomSegment(start: 0, riseEnd: 1, fallStart: 7, end: 8, peak: 2,
+            centerPath: path, cameraKeyframes: controls).normalized()
+        func matches(_ a: DemoZoomPose, _ b: DemoZoomPose) -> Bool {
+            abs(a.scale - b.scale) < 0.0000001 && abs(a.x - b.x) < 0.0000001 && abs(a.y - b.y) < 0.0000001
+        }
+        for indices in [[3], [2, 3, 4], [2, 5], [1], [7]] {
+            let ids = Set(indices.map { controls[$0].id })
+            var spans: [(Double, Double)] = []
+            var first = indices[0], last = indices[0]
+            for index in indices.dropFirst() {
+                if index == last + 1 { last = index }
+                else { spans.append((controls[first - 1].time, controls[last + 1].time)); first = index; last = index }
+            }
+            spans.append((controls[first - 1].time, controls[last + 1].time))
+            var deleted = original
+            deleted.removeCameraKeyframes(ids: ids)
+            try check(deleted.centerPath == path && deleted.cameraControlPoints.map(\.id) == controls.filter { !ids.contains($0.id) }.map(\.id),
+                      "删除运动锚点修改了原始路径或无关控制点")
+            for (lower, upper) in spans {
+                let a = original.pose(at: lower), b = original.pose(at: upper)
+                let dx = b.x - a.x, dy = b.y - a.y, length = dx * dx + dy * dy
+                var previousProgress = -0.0000001
+                for fraction in stride(from: 0.0, through: 1.0, by: 0.01) {
+                    let pose = deleted.pose(at: lower + (upper - lower) * fraction)
+                    let x = pose.x - a.x, y = pose.y - a.y
+                    let progress = length > 0.000000001 ? (x * dx + y * dy) / length : 0
+                    try check(abs(x * dy - y * dx) < 0.0000001 && progress >= previousProgress - 0.0000001 &&
+                              progress >= -0.0000001 && progress <= 1.0000001,
+                              "删除锚点后幸存节点之间仍沿弯曲/打圈路线，或直线平移发生回头/过冲")
+                    previousProgress = progress
+                }
+            }
+            for time in stride(from: 0.0, through: 8.0, by: 0.013) where !spans.contains(where: { $0.0 < time && time < $0.1 }) {
+                try check(matches(deleted.pose(at: time), original.pose(at: time)), "删除节点的直线衔接改变了区间外运动")
+            }
+            let decoded = try JSONDecoder().decode(ZoomSegment.self, from: JSONEncoder().encode(deleted))
+            let shifted = decoded.shifted(by: -1.37).normalized()
+            try check(decoded == deleted, "删除后的直线平移区间未完整保存")
+            for time in stride(from: 0.0, through: 6.5, by: 0.017) {
+                try check(matches(shifted.pose(at: time), deleted.pose(at: time + 1.37)), "剪切偏移改变了删除后的直线区间")
+            }
+            let lower = spans[0].0, upper = spans[0].1, insertionTime = lower + (upper - lower) * 0.37
+            var inserted = deleted
+            _ = inserted.addCameraKeyframe(at: insertionTime)
+            for time in stride(from: 0.0, through: 8.0, by: 0.011) {
+                try check(matches(inserted.pose(at: time), deleted.pose(at: time)), "删除后在直线区间加点改变了原有运动")
+            }
+            let oldCenter = inserted.pose(at: insertionTime)
+            inserted.setFramingCenter(x: oldCenter.x + 0.02, y: oldCenter.y - 0.015, at: insertionTime)
+            try check(abs(inserted.pose(at: insertionTime).x - oldCenter.x - 0.02) < 0.0000001 &&
+                      abs(inserted.pose(at: insertionTime).y - oldCenter.y + 0.015) < 0.0000001 && inserted.centerPath == path,
+                      "删除后新增的取景节点不能继续拖动，或拖动覆盖了原始路径")
+            for time in stride(from: 0.0, through: 8.0, by: 0.023) where time < lower || time > upper {
+                try check(matches(inserted.pose(at: time), deleted.pose(at: time)), "拖动直线区间内新增点影响了区间外画面")
+            }
+            let insertedControl = inserted.cameraControlPoints.first { abs($0.time - insertionTime) < 0.000001 }!
+            let movedTime = insertionTime + (upper - lower) * 0.1
+            let movedPose = inserted.pose(at: insertionTime)
+            inserted.updateCameraKeyframe(id: insertedControl.id, time: movedTime, scale: insertedControl.scale)
+            try check(matches(inserted.pose(at: movedTime), movedPose), "删除后新增节点移动时间时没有保留其取景位置")
+            inserted.removeCameraKeyframes(ids: [insertedControl.id])
+            for time in stride(from: 0.0, through: 8.0, by: 0.019) {
+                try check(matches(inserted.pose(at: time), deleted.pose(at: time)), "直线区间内新增、拖动、移动时间再删除节点未恢复原有直连")
+            }
+        }
+        let clip = DemoClip(title: "删除直线衔接", sourceStart: 0, duration: 8, zooms: [original])
+        let model = EditorModel()
+        model.clips = [clip]; model.selectedClipID = clip.id; model.selectedZoomID = original.id
+        let selected: Set<UUID> = [controls[2].id, controls[3].id, controls[4].id]
+        model.selectCameraAnchors(selected, in: clip.id, zoomID: original.id)
+        try check(model.deleteSelected() && model.selectedZoom?.centerPath == path, "模型未执行连续节点删除")
+        model.undo()
+        try check(model.clips == [clip] && model.selectedCameraAnchorIDs == selected, "一次撤销未恢复直线区间删除前的数据与选择")
+        print("PASS deleted motion spans: single/contiguous/disjoint groups, protected boundaries, straight monotone pans, unchanged outside/base, exact insertion, continued dragging, persistence, shifted cuts and Undo")
+    }
+
+    private static func checkCameraTargetNavigation() throws {
+        let firstZoom = ZoomSegment(start: 0, riseEnd: 1, fallStart: 3, end: 4, peak: 1.6, manualFocus: true)
+        var duplicate = firstZoom; duplicate.id = UUID()
+        let overlap = ZoomSegment(start: 0.5, riseEnd: 1, fallStart: 2, end: 3, peak: 1.8, manualFocus: true)
+        let secondZoom = ZoomSegment(start: 0, riseEnd: 0.5, fallStart: 2, end: 3, peak: 1.6, manualFocus: true)
+        let hidden = ZoomSegment(start: -2, riseEnd: -0.5, fallStart: 2, end: 4, peak: 1.6, manualFocus: true)
+        let first = DemoClip(title: "前片", sourceStart: 10, duration: 4, zooms: [firstZoom, duplicate, overlap])
+        let second = DemoClip(title: "后片", sourceStart: 90, duration: 3, zooms: [secondZoom])
+        let empty = DemoClip(title: "空镜头片段", sourceStart: 0, duration: 2, zooms: [])
+        let clipped = DemoClip(title: "片外锚点", sourceStart: 0, duration: 1, zooms: [hidden])
+        let original = [first, second, empty, clipped]
+        let model = EditorModel()
+        model.clips = original; model.selectedClipID = first.id; model.selectedZoomID = duplicate.id
+        let expected = [0.0, 0.5, 1, 2, 3, 4, 4.5, 6, 7, 9, 10]
+        try check(model.cameraNavigationTimes == expected && !model.showsFramingOverlay,
+                  "导航未按全局时间合并锚点与片段边界、去除等时目标或排除片外锚点")
+        model.seek(0.6)
+        try check(model.navigateCameraTarget(forward: true) && model.playhead == 1 &&
+                  model.selectedClipID == first.id && model.selectedZoomID == duplicate.id &&
+                  model.selectedCameraAnchorIDs == [duplicate.cameraControlPoints[1].id] && model.editingSelectionTarget == .cameraAnchors,
+                  "关闭辅助层时无法导航，或重合时刻未优先保留当前镜头选择")
+        try check(model.navigateCameraTarget(forward: true) && model.playhead == 2 && model.selectedZoomID == overlap.id,
+                  "下一目标未跳到最近的其他镜头锚点")
+        model.selectedClipID = second.id; model.selectedZoomID = secondZoom.id; model.seek(3.8)
+        try check(model.navigateCameraTarget(forward: true) && model.playhead == 4 &&
+                  model.selectedClipID == second.id && model.selectedClipID == model.activeClip?.id &&
+                  model.selectedCameraAnchorIDs == [secondZoom.cameraControlPoints[0].id],
+                  "片段交界处没有选中实际播放的后一片段及其同刻节点")
+        model.seek(8)
+        try check(model.navigateCameraTarget(forward: true) && model.playhead == 9 &&
+                  model.editingSelectionTarget == .clip && model.selectedCameraAnchorIDs.isEmpty && model.selectedZoomID == nil &&
+                  model.selectedClipID == clipped.id && model.selectedClipID == model.activeClip?.id,
+                  "纯片段边界导航没有清除旧锚点选择")
+        model.seek(10)
+        for target in expected.reversed().dropFirst() {
+            try check(model.navigateCameraTarget(forward: false) && model.playhead == target &&
+                      model.selectedClipID == model.activeClip?.id,
+                      "向前导航重复同刻目标、遗漏最近目标或混用了原片时间")
+        }
+        let firstSelection = model.selectedCameraAnchorIDs
+        try check(!model.navigateCameraTarget(forward: false) && model.playhead == 0 && model.selectedCameraAnchorIDs == firstSelection,
+                  "起点导航发生循环或无目标时更改了选择")
+        for target in expected.dropFirst() {
+            try check(model.navigateCameraTarget(forward: true) && model.playhead == target &&
+                      model.selectedClipID == model.activeClip?.id, "向后导航没有遍历全局目标，或选择与实际画面所属片段不同")
+        }
+        try check(!model.navigateCameraTarget(forward: true) && model.playhead == 10 && model.clips == original && !model.canUndo,
+                  "终点导航发生循环，或导航规范化/修改了镜头数据及撤销历史")
+        model.seek(2.2); model.isPlaying = true
+        try check(model.navigateCameraTarget(forward: true) && model.playhead == 3 && !model.isPlaying,
+                  "播放时导航没有暂停并精确定位")
+        model.isExporting = true
+        let before = model.playhead
+        try check(!model.navigateCameraTarget(forward: true) && model.playhead == before, "导出时导航未禁用")
+        model.isExporting = false
+        print("PASS camera target navigation: global chronological anchors/boundaries, same-time deduplication, contextual overlap selection, clipped/empty segments, no looping, processed-preview use, playback pause and no content/Undo mutation")
+    }
+
     private static func checkCameraAnchorDragging() throws {
         let centers = [ZoomCenterPoint(time: 0, x: 0.5, y: 0.5),
             ZoomCenterPoint(time: 1, x: 0.62, y: 0.42),
@@ -504,7 +647,8 @@ enum ProjectSelfTest {
         try check(model.clips.count == 2 && model.totalDuration == 8 &&
                   model.selectedZoom!.cameraControlPoints.count == 5 &&
                   !model.selectedZoom!.cameraControlPoints.contains(where: { $0.id == a.id }) &&
-                  model.selectedZoom!.manualCenterPath?.contains(where: { abs($0.time - 2) < 0.000001 }) == false,
+                  model.selectedZoom!.manualCenterPath == zoom.manualCenterPath &&
+                  !model.selectedZoom!.framingKeyframes.contains(where: { abs($0.time - 2) < 0.000001 }),
                   "删除锚点误删片段、改变总长或残留对应位置控制")
         let after = model.clips
         try check(!model.canDeleteSelection && !model.deleteSelected() && model.clips == after,
@@ -546,7 +690,8 @@ enum ProjectSelfTest {
         legacyModel.selectZoom(legacy.id)
         legacyModel.selectedMotionPointTime = 2.2
         try check(legacyModel.canDeleteSelection && legacyModel.deleteSelected() && legacyModel.clips.count == 2 &&
-                  legacyModel.selectedZoom!.cameraKeyframes == nil && legacyModel.selectedZoom!.manualCenterPath!.count == 4,
+                  legacyModel.selectedZoom!.cameraKeyframes == nil && legacyModel.selectedZoom!.manualCenterPath == path &&
+                  !legacyModel.selectedZoom!.framingKeyframes.contains(where: { abs($0.time - 2.2) < 0.000001 }),
                   "旧版中心轨迹节点无法单独删除")
         for time in stride(from: 0.0, through: 5.0, by: 0.05) {
             try check(legacyModel.selectedZoom!.scale(at: time) == legacy.scale(at: time),
@@ -1215,9 +1360,21 @@ enum ProjectSelfTest {
                   saved.trace.samples[0].x == trace.samples[0].x,
                   "自动路线编辑没有保存重开，或改变了原片与鼠标记录")
         model.selectFramingAnchor(at: 2.117)
+        let beforeDeletion = model.selectedZoom!
+        let deletingIndex = beforeDeletion.cameraControlPoints.firstIndex { abs($0.time - 2.117) < 0.000001 }!
+        let lower = beforeDeletion.cameraControlPoints[deletingIndex - 1].time
+        let upper = beforeDeletion.cameraControlPoints[deletingIndex + 1].time
         try check(model.selectedCameraAnchorIDs.count == 1 && model.canDeleteSelection && model.deleteSelected() &&
                   model.clips.count == before.count && model.selectedZoom!.centerPath == path,
                   "自动路线节点选择或删除失败，或误改素材/原始路线")
+        let startCenter = beforeDeletion.pose(at: lower), endCenter = beforeDeletion.pose(at: upper)
+        for fraction in stride(from: 0.0, through: 1.0, by: 0.02) {
+            let center = model.selectedZoom!.pose(at: lower + (upper - lower) * fraction)
+            try check(abs((center.x - startCenter.x) * (endCenter.y - startCenter.y) -
+                          (center.y - startCenter.y) * (endCenter.x - startCenter.x)) < 0.0000001,
+                      "模型删除节点后没有直线连接幸存节点")
+        }
+        try check((try ProjectStore.load(folder: folder).clips) == model.clips, "删除后的直线平移未自动保存")
         model.undo()
         try check(model.clips == edited && model.selectedCameraAnchorIDs.count == 1,
                   "自动路线节点删除未由一次撤销恢复修改及选择")
@@ -1226,6 +1383,16 @@ enum ProjectSelfTest {
         try check(model.clips == before && model.player.currentItem === item &&
                   (try ProjectStore.load(folder: folder).clips) == before,
                   "一次轨迹拖动未完整撤销并保存，或重载了原片")
+        model.setShowsFramingOverlay(false)
+        try await waitForFraming(model, enabled: false)
+        let beforeNavigation = try Data(contentsOf: project.jsonURL)
+        let canUndoBeforeNavigation = model.canUndo
+        model.seek(2.117)
+        let nextTime = model.cameraNavigationTimes.first { $0 > model.playhead + 0.000001 }!
+        try check(model.navigateCameraTarget(forward: true) && abs(model.playhead - nextTime) < 0.000001 &&
+                  model.clips == before && model.canUndo == canUndoBeforeNavigation &&
+                  (try Data(contentsOf: project.jsonURL)) == beforeNavigation,
+                  "导航修改了编辑数据、撤销历史或工程文件")
         print("PASS automatic motion editing: dense circular preview/curve identity, exact visible handles, raw player retention, original media/trace, persisted offsets, node delete and single-gesture Undo")
     }
 
@@ -1485,7 +1652,8 @@ enum ProjectSelfTest {
         model.setZoom(legacy, for: first.id)
         model.selectFramingAnchor(at: 1.7)
         try check(model.selectedMotionPointTime == 1.7 && model.canDeleteSelection && model.deleteSelected() &&
-                  model.selectedZoom!.manualCenterPath!.count == 4 && model.selectedZoom!.cameraKeyframes == nil &&
+                  model.selectedZoom!.manualCenterPath == path && model.selectedZoom!.cameraKeyframes == nil &&
+                  !model.selectedZoom!.framingKeyframes.contains(where: { abs($0.time - 1.7) < 0.000001 }) &&
                   model.clips.count == 2 && model.player.currentItem === item, "旧版预览位置节点删除失败或误删素材")
         model.undo()
         try check(model.selectedZoom == legacy && model.selectedMotionPointTime == 1.7 &&

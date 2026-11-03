@@ -56,15 +56,22 @@ final class EditorWindow: NSWindow, NSWindowDelegate {
     }
 
     override func sendEvent(_ event: NSEvent) {
-        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         guard event.type == .keyDown, isKeyWindow, attachedSheet == nil,
-              event.window === self, modifiers.isEmpty,
-              event.keyCode == 51 || event.keyCode == 117,
-              !isEditingText else {
+              event.window === self, !isEditingText else {
             super.sendEvent(event)
             return
         }
-        deleteSelection()
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if (event.keyCode == 126 || event.keyCode == 125),
+           modifiers.isEmpty, !editorModel.isExporting {
+            _ = editorModel.navigateCameraTarget(forward: event.keyCode == 125)
+            return
+        }
+        if (event.keyCode == 51 || event.keyCode == 117), modifiers.isEmpty {
+            deleteSelection()
+            return
+        }
+        super.sendEvent(event)
     }
 
     private func hideSystemTitlebarControls() {
