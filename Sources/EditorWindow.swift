@@ -1233,10 +1233,10 @@ private struct ProductionZoomGraph: View {
             marqueeRect = rect
             guard let item = locations.first(where: isSelected), !rect.isNull else { return }
             let controls = item.zoom.cameraControlPoints
-            let captured = controls.enumerated().filter { index, control in
-                index > 0 && index < controls.count - 1 && control.time >= 0 && control.time <= item.clip.duration &&
+            let captured = controls.filter { control in
+                control.time >= 0 && control.time <= item.clip.duration &&
                     rect.insetBy(dx: -3, dy: -3).contains(point(item.offset + control.time, control.scale))
-            }.map { $0.element.id }
+            }.map(\.id)
             model.selectCameraAnchors(marqueeSeed.union(captured), in: item.clip.id, zoomID: item.zoom.id)
         }.onEnded { value in
             defer { marqueeRect = nil; marqueeStart = nil; marqueeSeed = [] }

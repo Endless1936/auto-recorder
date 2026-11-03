@@ -1050,6 +1050,65 @@ enum EditorUISelfTest {
             record("curve-marquee-common-delta-bounds-and-undo", began,
                    "A real background marquee selected three unequal interior nodes; diagonal dragging changed only their common height delta, respected 3×/1× bounds, preserved differences and left endpoints/unselected nodes untouched.")
 
+            began = Date()
+            for first in [true, false] {
+                let endpoint = first ? groupPoints[0] : groupPoints[groupPoints.count - 1]
+                let startTime = first ? duration * 0.07 : duration * 0.93
+                try await drag(from: cameraGraphPoint(globalTime: offset + startTime, scale: 0.65),
+                               to: cameraGraphPoint(globalTime: offset + endpoint.time, scale: 1.3))
+                try require(model.editingSelectionTarget == .cameraAnchors &&
+                            model.selectedCameraAnchorIDs == [endpoint.id] && !model.canDeleteSelection && model.clips == fixture,
+                            "A native marquee did not select and highlight only its protected \(first ? "first" : "last") endpoint.")
+                let endpointID = "editor.zoom.\(groupZoom.id.uuidString).anchor.\(endpoint.id.uuidString)"
+                if let value = accessibilityElements().first(where: { $0.accessibilityIdentifier() == endpointID })?.accessibilityValue() as? String {
+                    try require(value.contains("已选择"), "The marquee-selected protected endpoint did not expose its selected highlight state.")
+                }
+                try await deleteKey()
+                try require(model.clips == fixture && model.selectedCameraAnchorIDs == [endpoint.id],
+                            "Delete changed data or cleared selection on a protected marquee endpoint.")
+            }
+            try screenshot("curve-marquee-last-endpoint-selected")
+            record("curve-marquee-protected-first-and-last-endpoints", began,
+                   "Native background rectangles selected each 1× endpoint independently, exposed its selected state and kept both data and highlight when Delete was pressed.")
+
+            began = Date()
+            let mixedIDs: Set<UUID> = [groupPoints[4].id, groupPoints[5].id]
+            try await drag(from: cameraGraphPoint(globalTime: offset + duration * 0.73, scale: 0.65),
+                           to: cameraGraphPoint(globalTime: offset + duration, scale: 2.0))
+            try require(model.selectedCameraAnchorIDs == mixedIDs && model.canDeleteSelection && model.clips == fixture,
+                        "A native marquee did not select the last endpoint together with only its neighboring interior node.")
+            let mixedNodeID = "editor.zoom.\(groupZoom.id.uuidString).anchor.\(groupPoints[4].id.uuidString)"
+            try await drag(from: center(try frame(mixedNodeID)),
+                           to: cameraGraphPoint(globalTime: offset + groupPoints[4].time, scale: 2.35))
+            guard let mixedRaised = model.selectedZoom?.cameraControlPoints else {
+                throw failure("Dragging a mixed endpoint/interior selection lost the camera curve.")
+            }
+            try require(mixedRaised.count == groupPoints.count && model.selectedCameraAnchorIDs == mixedIDs &&
+                        mixedRaised[4].scale > groupPoints[4].scale + 0.25 &&
+                        mixedRaised.first?.scale == 1 && mixedRaised.last?.scale == 1 &&
+                        mixedRaised.indices.allSatisfy({ abs(mixedRaised[$0].time - groupPoints[$0].time) < 0.000001 }) &&
+                        (0...3).allSatisfy({ mixedRaised[$0] == groupPoints[$0] }),
+                        "Mixed group dragging raised a protected endpoint, failed to raise the interior node, or changed another node/time.")
+            let mixedRaisedClips = model.clips
+            try await deleteKey()
+            guard let mixedDeleted = model.selectedZoom?.cameraControlPoints else {
+                throw failure("Deleting a mixed endpoint/interior selection removed its zoom.")
+            }
+            try require(model.clips.count == fixture.count && mixedDeleted.count == groupPoints.count - 1 &&
+                        mixedDeleted.map(\.id) == groupPoints.filter { $0.id != groupPoints[4].id }.map(\.id) &&
+                        mixedDeleted.first?.scale == 1 && mixedDeleted.last?.scale == 1 &&
+                        model.player.currentItem === previewItem && (try persistedClips()) == model.clips,
+                        "Delete on a mixed marquee did not preserve its protected endpoints and remove only the interior node.")
+            try await undo()
+            try require(model.clips == mixedRaisedClips && model.selectedCameraAnchorIDs == mixedIDs,
+                        "One Undo did not restore the deleted interior node and its mixed endpoint selection.")
+            try await undo()
+            try require(model.clips == fixture && model.selectedCameraAnchorIDs == mixedIDs &&
+                        (try persistedClips()) == fixture && model.player.currentItem === previewItem,
+                        "The second Undo did not restore the mixed group's original amplitudes, selection and saved data.")
+            record("curve-marquee-mixed-endpoint-group-drag-delete-undo", began,
+                   "A rectangle selected the final 1× endpoint and its neighboring interior node; upward dragging raised only the interior amplitude, Delete removed only that node and two Undo steps restored data and mixed selection.")
+
             try await click("editor.framing.toggle")
             try await waitUntil("Curve-selection tests did not restore processed preview.") {
                 !self.model.showsFramingOverlay && self.model.previewCameraEffectsEnabled
