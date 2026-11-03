@@ -29,6 +29,7 @@ enum ProjectSelfTest {
                   "工程中的原片路径必须相对文件夹")
         let original = try Data(contentsOf: project.sourceURL)
         print("PASS project creation: dated folder, relative original, multiple editable zooms and saved camera centers")
+        try await checkUnchangedAutosave(source: fixtureURL, duration: sourceDuration, directory: directory)
         try await checkOverlappingLoads(olderFolder: folder, source: fixtureURL,
                                         duration: sourceDuration, directory: directory)
         try await checkFramingPreview(source: fixtureURL, duration: sourceDuration, directory: directory)
@@ -608,11 +609,11 @@ enum ProjectSelfTest {
         groupModel.seek(2.7)
         let ids: Set<UUID> = [firstPeak.id, second.id, group.cameraControlPoints.first!.id]
         let originalTimes = group.cameraControlPoints.map(\.time)
-        groupModel.dragCameraAnchors(from: group, ids: ids, timeDelta: 100, scaleDelta: 100, snapTolerance: 0)
+        groupModel.dragCameraAnchors(from: group, ids: ids, timeDelta: 0, scaleDelta: 100, snapTolerance: 0)
         try check(abs(groupModel.selectedZoom!.scale(at: 1) - 2.4) < 0.0000001 && groupModel.selectedZoom!.scale(at: 2) == 3 &&
                   groupModel.selectedZoom!.cameraControlPoints.map(\.time) == originalTimes && abs(groupModel.playhead - 2.7) < 0.0000001,
                   "批量上拖到上限时抹平了原倍率差、移动了时间或跳转了播放头")
-        groupModel.dragCameraAnchors(from: group, ids: ids, timeDelta: -100, scaleDelta: -100, snapTolerance: 0)
+        groupModel.dragCameraAnchors(from: group, ids: ids, timeDelta: 0, scaleDelta: -100, snapTolerance: 0)
         try check(groupModel.selectedZoom!.scale(at: 1) == 1 && abs(groupModel.selectedZoom!.scale(at: 2) - 1.6) < 0.0000001 &&
                   groupModel.selectedZoom!.cameraControlPoints.first!.scale == 1,
                   "批量下拖到下限时单独压平了节点，或改变了端点倍率")
@@ -621,12 +622,72 @@ enum ProjectSelfTest {
         try check(groupGuide == 1.3 && abs(groupModel.selectedZoom!.scale(at: 1) - 1.3) < 0.0000001 &&
                   abs(groupModel.selectedZoom!.scale(at: 2) - 1.9) < 0.0000001,
                   "批量吸附没有给所有选中节点应用相同偏移")
+        func assertShift(_ result: ZoomSegment, from base: ZoomSegment, ids: Set<UUID>, by delta: Double) throws {
+            for point in base.cameraControlPoints {
+                let moved = result.cameraControlPoints.first { $0.id == point.id }!
+                try check(abs(moved.time - point.time - (ids.contains(point.id) ? delta : 0)) < 0.0000001,
+                          "框选组没有应用同一时间位移，或移动了未选节点")
+            }
+            try check(result.cameraControlPoints.first!.scale == 1 && result.cameraControlPoints.last!.scale == 1,
+                      "框选组左右移动改变了全景端点倍率")
+        }
+        let horizontalModel = prepared(group)
+        horizontalModel.clips.append(DemoClip(title: "接近的外部倍率", sourceStart: 6, duration: 3,
+            zooms: [ZoomSegment.standard(duration: 3, peak: 1.58)]))
+        let horizontalIDs = Set(group.cameraControlPoints.map(\.id))
+        let horizontalGuide = horizontalModel.dragCameraAnchors(from: group, ids: horizontalIDs,
+            timeDelta: 0.25, scaleDelta: 0, snapTolerance: 0.03)
+        try assertShift(horizontalModel.selectedZoom!, from: group, ids: horizontalIDs, by: 0.25)
+        try check(horizontalGuide == nil && horizontalModel.selectedZoom!.cameraControlPoints.map(\.scale) == group.cameraControlPoints.map(\.scale),
+                  "完全水平的框选组拖动被其他片段的接近倍率吸附，改变了节点高度")
+        groupModel.dragCameraAnchors(from: group, ids: ids, timeDelta: 0.4, scaleDelta: 0.2, snapTolerance: 0)
+        try assertShift(groupModel.selectedZoom!, from: group, ids: ids, by: 0.4)
+        try check(abs(groupModel.selectedZoom!.cameraControlPoints.first { $0.id == second.id }!.scale - 2.4) < 0.0000001,
+                  "端点与中间点一起斜向拖动时，中间点倍率没有独立变化")
+        groupModel.dragCameraAnchors(from: group, ids: ids, timeDelta: 100, scaleDelta: 0, snapTolerance: 0)
+        try assertShift(groupModel.selectedZoom!, from: group, ids: ids, by: 0.95)
+        groupModel.dragCameraAnchors(from: group, ids: ids, timeDelta: -100, scaleDelta: 0, snapTolerance: 0)
+        try check(groupModel.selectedZoom == group, "选中片段起点的组越过零时刻，或原位拖动产生无效格式转换")
+        let rightIDs: Set<UUID> = [group.cameraControlPoints[group.cameraControlPoints.count - 2].id,
+                                    group.cameraControlPoints.last!.id]
+        groupModel.dragCameraAnchors(from: group, ids: rightIDs, timeDelta: -0.4, scaleDelta: 0, snapTolerance: 0)
+        try assertShift(groupModel.selectedZoom!, from: group, ids: rightIDs, by: -0.4)
+        groupModel.dragCameraAnchors(from: group, ids: rightIDs, timeDelta: 100, scaleDelta: 0, snapTolerance: 0)
+        try assertShift(groupModel.selectedZoom!, from: group, ids: rightIDs, by: 1)
+        let separateIDs: Set<UUID> = [firstPeak.id, third.id]
+        groupModel.dragCameraAnchors(from: group, ids: separateIDs, timeDelta: -100, scaleDelta: 0, snapTolerance: 0)
+        try assertShift(groupModel.selectedZoom!, from: group, ids: separateIDs, by: -0.95)
+        var pan = group
+        pan.removeCameraKeyframes(ids: [second.id])
+        pan = pan.normalized()
+        let panModel = prepared(pan), panIDs: Set<UUID> = [firstPeak.id, third.id]
+        panModel.dragCameraAnchors(from: pan, ids: panIDs, timeDelta: 0.4, scaleDelta: 0, snapTolerance: 0)
+        try assertShift(panModel.selectedZoom!, from: pan, ids: panIDs, by: 0.4)
+        try check(panModel.selectedZoom!.centerPanSpans?.contains {
+            abs($0.start - 1.4) < 0.0000001 && abs($0.end - 3.4) < 0.0000001
+        } == true, "批量平移没有同步移动删除锚点后形成的平移区间边界")
+        var automatic = ZoomSegment(start: 0, riseEnd: 1, fallStart: 4, end: 5, peak: 1.8,
+            centerPath: centers)
+        _ = automatic.addCameraKeyframe(at: 2)
+        automatic.setFramingCenter(x: 0.58, y: 0.44, at: 2)
+        automatic = automatic.normalized()
+        let automaticModel = prepared(automatic)
+        let allIDs = Set(automatic.cameraControlPoints.map(\.id))
+        automaticModel.dragCameraAnchors(from: automatic, ids: allIDs, timeDelta: 0.4, scaleDelta: 0, snapTolerance: 0)
+        let shifted = automaticModel.selectedZoom!
+        try assertShift(shifted, from: automatic, ids: allIDs, by: 0.4)
+        for point in automatic.cameraControlPoints {
+            let a = automatic.pose(at: point.time), b = shifted.pose(at: point.time + 0.4)
+            try check(abs(a.x - b.x) < 0.0000001 && abs(a.y - b.y) < 0.0000001,
+                      "批量时间平移没有从原始快照同步移动取景中心")
+        }
+        try check(shifted.centerPath == automatic.centerPath, "批量时间平移覆盖了原始鼠标中心轨迹")
         let endpoint = legacy.cameraControlPoints.first!
         let endpointModel = prepared(legacy)
         endpointModel.dragCameraAnchors(from: legacy, ids: [endpoint.id], timeDelta: 0.2, scaleDelta: 2, snapTolerance: 0)
         try check(abs(endpointModel.selectedZoom!.start - 0.2) < 0.0000001 && endpointModel.selectedZoom!.cameraControlPoints.first!.scale == 1 &&
                   endpointModel.selectedZoom!.scale(at: 4) == 1.6, "端点不能调整时间，或端点拖动改变了固定全景倍率")
-        print("PASS camera anchor drag: independent legacy peaks, no-op snap without conversion/history, immutable gesture deltas, near/far/global snapping, shared group bounds and offsets, fixed endpoints and invalid-input guard")
+        print("PASS camera anchor drag: independent peaks, no-op/history, shared time/scale deltas and snapping, contiguous/disjoint and endpoint group bounds, linked automatic centers, fixed endpoint scales and invalid-input guard")
     }
 
     private static func checkCameraSelectionDeletion() throws {
@@ -1001,6 +1062,41 @@ enum ProjectSelfTest {
             }
         }
         print("PASS curve math: strict four-point timing, nonzero smooth ramps, exact nodes, dense monotone samples, amplitude drags, degenerate repair and partial-cut boundaries")
+    }
+
+    private static func checkUnchangedAutosave(source: URL, duration: Double, directory: URL) async throws {
+        let folder = directory.appendingPathComponent("已保存工程重复保存", isDirectory: true)
+        let movedFolder = directory.appendingPathComponent("已保存工程外部移动", isDirectory: true)
+        let project = try ProjectStore.create(directory: folder, rawURL: source,
+            trace: CursorTrace(samples: []), fps: 30, quality: .hevc, duration: duration,
+            pixelSize: CGSize(width: 640, height: 360), autoZoomEnabled: false)
+        let model = EditorModel()
+        try await model.loadProject(folder: folder)
+        let saved = try Data(contentsOf: project.jsonURL)
+        let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: timestamp], ofItemAtPath: project.jsonURL.path)
+        try model.autosave()
+        let attributes = try FileManager.default.attributesOfItem(atPath: project.jsonURL.path)
+        try check(attributes[.modificationDate] as? Date == timestamp && Data(contentsOf: project.jsonURL) == saved,
+                  "未修改的工程不应重复写入参数文件")
+
+        try FileManager.default.moveItem(at: folder, to: movedFolder)
+        try model.autosave()
+        try check(!FileManager.default.fileExists(atPath: folder.path) &&
+                  Data(contentsOf: movedFolder.appendingPathComponent("project.json")) == saved,
+                  "已保存工程被外部移动后重复保存不应报错、重建旧目录或改动工程")
+
+        model.fps = 60; model.quality = .proRes
+        var saveFailed = false
+        do { try model.autosave() } catch { saveFailed = true }
+        try check(saveFailed && !FileManager.default.fileExists(atPath: folder.path),
+                  "旧工程确有未保存修改时必须保留失败，不能吞错或重建失效目录")
+        try FileManager.default.moveItem(at: movedFolder, to: folder)
+        try model.autosave()
+        let retried = try ProjectStore.load(folder: folder)
+        try check(retried.fps == 60 && retried.quality == .proRes && retried.clips == model.clips,
+                  "失败后恢复目录并重试，必须真正保存未提交修改")
+        print("PASS unchanged autosave: no redundant writes, moved saved projects do not block new work, unsaved failures remain explicit and retry persists changes")
     }
 
     private static func checkOverlappingLoads(olderFolder: URL, source: URL,
@@ -1558,8 +1654,8 @@ enum ProjectSelfTest {
         let before = model.clips
         let ids: Set<UUID> = [lower.id, higher.id]
         model.beginEditing()
-        model.dragCameraAnchors(from: zoom, ids: ids, timeDelta: 1, scaleDelta: 0.2, snapTolerance: 0)
-        model.dragCameraAnchors(from: zoom, ids: ids, timeDelta: 2, scaleDelta: 10, snapTolerance: 0)
+        model.dragCameraAnchors(from: zoom, ids: ids, timeDelta: 0, scaleDelta: 0.2, snapTolerance: 0)
+        model.dragCameraAnchors(from: zoom, ids: ids, timeDelta: 0, scaleDelta: 10, snapTolerance: 0)
         model.endEditing()
         let changed = model.clips
         try check(abs(model.selectedZoom!.scale(at: 2) - 2.1) < 0.0000001 && model.selectedZoom!.scale(at: 3) == 3 &&
@@ -1576,6 +1672,29 @@ enum ProjectSelfTest {
         model.undo()
         try check(model.clips == before && !model.canUndo && model.player.currentItem === item &&
                   (try ProjectStore.load(folder: folder).clips) == before, "一个批量手势不能由一次撤销完整恢复")
+        let mixedIDs: Set<UUID> = [zoom.cameraControlPoints.first!.id, lower.id]
+        let originalCenter = zoom.pose(at: 2)
+        model.beginEditing()
+        model.dragCameraAnchors(from: zoom, ids: mixedIDs, timeDelta: 0.1, scaleDelta: 0.1, snapTolerance: 0)
+        model.dragCameraAnchors(from: zoom, ids: mixedIDs, timeDelta: 0.25, scaleDelta: 0.2, snapTolerance: 0)
+        model.endEditing()
+        let moved = model.clips
+        let movedZoom = model.selectedZoom!
+        try check(abs(movedZoom.start - 0.25) < 0.0000001 && movedZoom.cameraControlPoints.first!.scale == 1 &&
+                  abs(movedZoom.cameraControlPoints.first { $0.id == lower.id }!.time - 2.25) < 0.0000001 &&
+                  abs(movedZoom.cameraControlPoints.first { $0.id == lower.id }!.scale - 1.5) < 0.0000001 &&
+                  abs(movedZoom.pose(at: 2.25).x - originalCenter.x) < 0.0000001 &&
+                  abs(movedZoom.pose(at: 2.25).y - originalCenter.y) < 0.0000001,
+                  "混合框选组没有同步保存时间、倍率和取景中心，或抬升了1×端点")
+        try check(model.player.currentItem === item && (try ProjectStore.load(folder: folder).clips) == moved &&
+                  (try encoder.encode(ProjectStore.load(folder: folder).trace)) == originalTrace &&
+                  (try Data(contentsOf: project.sourceURL)) == originalRaw,
+                  "混合框选组时间平移未保存，或替换了原片/轨迹/播放器")
+        try await reopened.loadProject(folder: folder)
+        try check(reopened.clips == moved, "重开工程没有恢复端点组的共同时间位移")
+        model.undo()
+        try check(model.clips == before && !model.canUndo && model.player.currentItem === item &&
+                  (try ProjectStore.load(folder: folder).clips) == before, "一次撤销未恢复端点组时间平移")
         model.beginEditing()
         model.dragCameraAnchors(from: zoom, ids: [UUID()], timeDelta: 1, scaleDelta: 1, snapTolerance: 0.1)
         model.endEditing()

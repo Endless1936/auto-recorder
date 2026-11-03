@@ -436,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             _ = try ProjectStore.create(directory: folder, rawURL: rawURL, trace: recorder.lastTrace ?? CursorTrace(samples: []),
                 fps: activeFPS, quality: activeQuality, duration: duration, pixelSize: pixelSize,
                 autoZoomEnabled: activeAutoZoom)
-            UserDefaults.standard.set(folder, forKey: "lastProject")
+            if integrationDirectory == nil { UserDefaults.standard.set(folder, forKey: "lastProject") }
             if integrationDirectory != nil {
                 openingProject = false; integrationReport("COMPLETED: \(folder.path)")
             } else {

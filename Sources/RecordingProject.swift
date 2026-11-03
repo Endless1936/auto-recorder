@@ -198,6 +198,64 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         peak = points.map(\.scale).max() ?? 1
     }
 
+    /// The caller bounds one shared time delta before applying the batch. Mapping
+    /// all center controls from this snapshot avoids collisions between old and
+    /// new timestamps when adjacent selected controls move past each other's old positions.
+    mutating func moveCameraKeyframes(ids: Set<UUID>, timeDelta: Double, scaleDelta: Double) {
+        enableCameraKeyframes()
+        guard var points = cameraKeyframes else { return }
+        let original = self
+        let moving = points.filter { ids.contains($0.id) }
+        if abs(timeDelta) > 0.000000001 {
+            func isMovedTime(_ time: Double) -> Bool {
+                moving.contains { abs($0.time - time) < 0.000001 || abs($0.time + timeDelta - time) < 0.000001 }
+            }
+            for point in moving { splitCenterPans(at: point.time) }
+            if var spans = centerPanSpans {
+                for index in spans.indices {
+                    var changed = false
+                    if let point = moving.first(where: { abs($0.time - spans[index].start) < 0.000001 }) {
+                        let center = original.pose(at: point.time)
+                        spans[index].start = point.time + timeDelta
+                        spans[index].startX = center.x; spans[index].startY = center.y; changed = true
+                    }
+                    if let point = moving.first(where: { abs($0.time - spans[index].end) < 0.000001 }) {
+                        let center = original.pose(at: point.time)
+                        spans[index].end = point.time + timeDelta
+                        spans[index].endX = center.x; spans[index].endY = center.y; changed = true
+                    }
+                    if changed { spans[index].useSmoothstepTiming() }
+                }
+                centerPanSpans = spans
+            }
+            if !manualFocus, !centerPath.isEmpty {
+                centerOffsets = (original.centerOffsets ?? []).filter { !isMovedTime($0.time) }
+                for point in moving {
+                    let center = original.pose(at: point.time), offset = original.centerOffset(at: point.time)
+                    let base = interpolatedCenter(in: centerPath, at: point.time + timeDelta)
+                    storeCenterOffset(CameraCenterOffset(time: point.time + timeDelta, x: center.x - base.0,
+                        y: center.y - base.1, slopeX: offset.slopeX, slopeY: offset.slopeY))
+                }
+            } else {
+                var path = (original.manualCenterPath ?? []).filter { !isMovedTime($0.time) }
+                for point in moving {
+                    let center = original.pose(at: point.time)
+                    let stored = original.manualCenterPath?.first { abs($0.time - point.time) < 0.000001 }
+                    path.append(ZoomCenterPoint(time: point.time + timeDelta, x: stored?.x ?? center.x, y: stored?.y ?? center.y))
+                }
+                manualCenterPath = path.sorted { $0.time < $1.time }
+            }
+        }
+        for index in points.indices where ids.contains(points[index].id) {
+            points[index].time += timeDelta
+            points[index].scale = index == 0 || index == points.count - 1 ? 1 : points[index].scale + scaleDelta
+            for neighbor in max(0, index - 1)...min(points.count - 1, index + 1) { points[neighbor].slope = nil }
+        }
+        cameraKeyframes = points
+        start = points[0].time; end = points[points.count - 1].time
+        peak = points.map(\.scale).max() ?? 1
+    }
+
     private mutating func moveCenterControl(from oldTime: Double, to newTime: Double) {
         let value = pose(at: oldTime)
         splitCenterPans(at: oldTime)
@@ -1218,8 +1276,8 @@ final class EditorModel: ObservableObject {
     }
 
     /// All values are derived from the gesture's immutable starting segment.
-    /// Multiple controls move vertically by one bounded delta so their relative
-    /// amplitudes survive both the 1×/3× bounds and a shared snap.
+    /// Multiple controls share bounded time/scale deltas so their spacing and
+    /// relative amplitudes survive neighboring controls and the 1×/3× limits.
     @discardableResult
     func dragCameraAnchors(from base: ZoomSegment, ids: Set<UUID>, timeDelta: Double,
                            scaleDelta: Double, snapTolerance: Double) -> Double? {
@@ -1238,7 +1296,7 @@ final class EditorModel: ObservableObject {
             let minimumDelta = 1 - amplitudeControls.map { $0.element.scale }.min()!
             let maximumDelta = 3 - amplitudeControls.map { $0.element.scale }.max()!
             delta = min(maximumDelta, max(minimumDelta, scaleDelta))
-            if snapTolerance > 0 {
+            if snapTolerance > 0 && abs(scaleDelta) > 0.000000001 {
                 let requestedDelta = delta
                 var levels: Set<Double> = [1, 3]
                 for candidateClip in clips {
@@ -1266,11 +1324,46 @@ final class EditorModel: ObservableObject {
         }
         var next = base
         if isGroup {
-            if abs(delta) > 0.000000001 {
-                for control in amplitudeControls {
-                    next.updateCameraKeyframe(id: control.element.id, time: control.element.time,
-                                              scale: control.element.scale + delta)
+            var minimumTimeDelta = -selected.map { $0.element.time }.min()!
+            var maximumTimeDelta = clip.duration - selected.map { $0.element.time }.max()!
+            let preferredGap = min(0.05, max(0.0000011, (base.end - base.start) / Double(max(2, controls.count * 4))))
+            func gap(_ available: Double) -> Double {
+                min(available, max(0.0000011, min(preferredGap, available / 2)))
+            }
+            for control in selected {
+                let index = control.offset, time = control.element.time
+                if index > 0, !selectedIDs.contains(controls[index - 1].id) {
+                    let previous = controls[index - 1].time
+                    minimumTimeDelta = max(minimumTimeDelta, previous + gap(time - previous) - time)
                 }
+                if index + 1 < controls.count, !selectedIDs.contains(controls[index + 1].id) {
+                    let following = controls[index + 1].time
+                    maximumTimeDelta = min(maximumTimeDelta, following - gap(following - time) - time)
+                }
+                if let spans = base.centerPanSpans, spans.contains(where: { $0.start <= time && time <= $0.end }) {
+                    let fixedBoundaries = spans.flatMap { [$0.start, $0.end] }.filter { boundary in
+                        !selected.contains { abs($0.element.time - boundary) < 0.000001 }
+                    }
+                    if let previous = fixedBoundaries.filter({ $0 < time - 0.000001 }).max() {
+                        minimumTimeDelta = max(minimumTimeDelta, previous + gap(time - previous) - time)
+                    }
+                    if let following = fixedBoundaries.filter({ $0 > time + 0.000001 }).min() {
+                        maximumTimeDelta = min(maximumTimeDelta, following - gap(following - time) - time)
+                    }
+                }
+            }
+            let others = clip.canonicalZooms().filter { $0.id != base.id }
+            if let first = controls.first, selectedIDs.contains(first.id) {
+                let left = others.filter { $0.start <= base.start }.map(\.end).max() ?? -.infinity
+                minimumTimeDelta = max(minimumTimeDelta, min(base.start, left) - first.time)
+            }
+            if let last = controls.last, selectedIDs.contains(last.id) {
+                let right = others.filter { $0.end >= base.end }.map(\.start).min() ?? .infinity
+                maximumTimeDelta = min(maximumTimeDelta, max(base.end, right) - last.time)
+            }
+            let shift = min(maximumTimeDelta, max(minimumTimeDelta, timeDelta))
+            if abs(delta) > 0.000000001 || abs(shift) > 0.000000001 {
+                next.moveCameraKeyframes(ids: selectedIDs, timeDelta: shift, scaleDelta: delta)
             }
         } else if let control = selected.first {
             let point = control.element
@@ -1792,6 +1885,11 @@ final class EditorModel: ObservableObject {
     func autosave() throws {
         canonicalizeZooms()
         guard var project else { return }
+        // A saved document may have been moved after returning to the recorder.
+        // Starting another recording must not rewrite that unchanged document.
+        guard project.clips != clips || project.selectedClipID != selectedClipID ||
+              project.selectedZoomID != selectedZoomID || project.playhead != playhead ||
+              project.fps != fps || project.quality != quality else { return }
         project.clips = clips; project.selectedClipID = selectedClipID
         project.selectedZoomID = selectedZoomID; project.playhead = playhead
         project.fps = fps; project.quality = quality

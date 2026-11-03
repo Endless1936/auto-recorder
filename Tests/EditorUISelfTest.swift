@@ -63,6 +63,11 @@ enum EditorUISelfTest {
             try require(!model.showsFramingOverlay && model.previewCameraEffectsEnabled,
                         "A newly opened editor must default to processed preview with framing assistance off.")
             try screenshot("initial")
+            if CommandLine.arguments.contains("--curve-drag-only") {
+                try await checkCameraCurveSelection(original: original)
+                try requireNoRuntimeErrors()
+                return
+            }
 
             // Land on the formerly ambiguous halves of the neighboring clips.
             let left = original[0].id
@@ -209,10 +214,10 @@ enum EditorUISelfTest {
                 let tools = optionalActualAccessibilityFrame("editor.zoomGraph.tools")
                 let firstNode = optionalActualAccessibilityFrame(firstNodeID)
                 let firstNodeOutline = firstNode?.insetBy(dx: -4, dy: -4)
-                try require(abs(timelineCanvas.minX - graphCanvas.minX) <= 1 &&
-                            abs(timelineCanvas.maxX - graphCanvas.maxX) <= 1 &&
+                try require(abs(timelineCanvas.minX - timelineData.minX) <= 1 &&
+                            abs(timelineCanvas.maxX - timelineData.maxX) <= 1 &&
                             abs(timelineData.minX - graphData.minX) <= 1 && abs(timelineData.maxX - graphData.maxX) <= 1,
-                            "Actual drawn timeline/curve canvases or data regions have different visible widths after a \(name) resize.")
+                            "The video timeline retains side padding or its time range differs from the curve after a \(name) resize.")
                 try require(graphCanvas.minX - labels.maxX >= 12 - 0.01,
                             "The actual scale-label column leaves less than twelve points to the canvas after a \(name) resize.")
                 if let firstNodeOutline {
@@ -1067,7 +1072,7 @@ enum EditorUISelfTest {
             try screenshot("curve-marquee-three-selected")
             let groupNodeID = "editor.zoom.\(groupZoom.id.uuidString).anchor.\(groupPoints[2].id.uuidString)"
             try await drag(from: center(try frame(groupNodeID)),
-                           to: cameraGraphPoint(globalTime: offset + duration * 0.46, scale: 2.9))
+                           to: cameraGraphPoint(globalTime: offset + groupPoints[2].time, scale: 2.9))
             guard let raised = model.selectedZoom?.cameraControlPoints else {
                 throw failure("Moving marquee-selected nodes lost their camera controls.")
             }
@@ -1089,7 +1094,7 @@ enum EditorUISelfTest {
                 }
             }
             try await drag(from: center(try frame(groupNodeID)),
-                           to: cameraGraphPoint(globalTime: offset + duration * 0.33, scale: 0.5))
+                           to: cameraGraphPoint(globalTime: offset + groupPoints[2].time, scale: 0.5))
             guard let lowered = model.selectedZoom?.cameraControlPoints else {
                 throw failure("Lowering the selected group lost its camera controls.")
             }
@@ -1108,7 +1113,38 @@ enum EditorUISelfTest {
             try await undo()
             try require(model.clips == fixture, "A second native Undo did not restore the original multilevel curve.")
             record("curve-marquee-common-delta-bounds-and-undo", began,
-                   "A real background marquee selected three unequal interior nodes; diagonal dragging changed only their common height delta, respected 3×/1× bounds, preserved differences and left endpoints/unselected nodes untouched.")
+                   "A real background marquee selected three unequal interior nodes; vertical dragging respected 3×/1× bounds, preserved differences and left times/endpoints/unselected nodes untouched.")
+
+            began = Date()
+            for first in [true, false] {
+                let indices = first ? [0, 1] : [4, 5]
+                let ids = Set(indices.map { groupPoints[$0].id })
+                let endpoint = groupPoints[first ? 0 : 5]
+                try await drag(from: cameraGraphPoint(globalTime: offset + duration * (first ? 0.27 : 0.73), scale: 0.65),
+                               to: cameraGraphPoint(globalTime: offset + duration * (first ? 0 : 1), scale: first ? 1.55 : 2.0))
+                try require(model.selectedCameraAnchorIDs == ids && model.clips == fixture,
+                            "A native marquee did not select the endpoint together with its neighboring node.")
+                let delta = duration * (first ? 0.06 : -0.06)
+                let endpointID = "editor.zoom.\(groupZoom.id.uuidString).anchor.\(endpoint.id.uuidString)"
+                try await drag(from: center(try frame(endpointID)),
+                               to: cameraGraphPoint(globalTime: offset + endpoint.time + delta, scale: 1))
+                guard let moved = model.selectedZoom?.cameraControlPoints else {
+                    throw failure("Horizontal endpoint-group dragging lost its camera controls.")
+                }
+                try require(moved.count == groupPoints.count && model.selectedCameraAnchorIDs == ids &&
+                            moved.indices.allSatisfy({ index in
+                                let original = groupPoints[index]
+                                return abs(moved[index].time - original.time - (ids.contains(original.id) ? delta : 0)) < 0.000001 &&
+                                    moved[index].scale == original.scale
+                            }), "Dragging the selected bottom endpoint did not move its whole group by one time delta, or changed a height/unselected point.")
+                try require(try persistedClips() == model.clips && model.player.currentItem === previewItem,
+                            "Horizontal endpoint-group dragging was not saved or replaced the raw video.")
+                try screenshot("curve-marquee-\(first ? "first" : "last")-endpoint-horizontal")
+                try await undo()
+                try require(model.clips == fixture, "One native Undo did not restore the horizontally moved endpoint group.")
+            }
+            record("curve-marquee-endpoints-horizontal-and-undo", began,
+                   "Real marquees selected each 1× endpoint with its neighbor; dragging the bottom endpoint shifted both times equally, kept every height/unselected node, saved and restored with one Undo.")
 
             began = Date()
             for first in [true, false] {
