@@ -186,9 +186,17 @@ enum PauseSelfTest {
     }
 
     private static func tone(at time: Double, frequency: Double, frames: Int, rate: Double = 48_000, channels: UInt32 = 2) throws -> CMSampleBuffer {
-        let values = (0..<frames).flatMap { frame -> [Float] in
-            let value = Float(0.3 * sin(2 * Double.pi * frequency * (time - 100 + Double(frame) / rate)))
-            return [Float](repeating: value, count: Int(channels))
+        let channelCount = Int(channels)
+        let angularFrequency: Double = 2.0 * Double.pi * frequency
+        let startOffset: Double = time - 100.0
+        var values: [Float] = []
+        values.reserveCapacity(frames * channelCount)
+        for frame in 0..<frames {
+            let sampleOffset: Double = Double(frame) / rate
+            let sampleTime: Double = startOffset + sampleOffset
+            let phase: Double = angularFrequency * sampleTime
+            let value = Float(0.3 * sin(phase))
+            for _ in 0..<channelCount { values.append(value) }
         }
         return try AudioMixer.sample(values, pts: CMTime(seconds: time, preferredTimescale: 48_000), sampleRate: rate, channels: channels)
     }
