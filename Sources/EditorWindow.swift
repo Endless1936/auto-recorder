@@ -817,14 +817,20 @@ private struct TimelinePlayheadTip: Shape {
 }
 
 struct EditorTimeAxisGeometry {
-    static let leadingInset: CGFloat = 38
+    static let scaleLabelWidth: CGFloat = 40
+    static let scaleLabelSpacing: CGFloat = 12
     static let toolColumnWidth: CGFloat = 32
-    static let toolSpacing: CGFloat = 4
-    static let trailingInset: CGFloat = toolColumnWidth + toolSpacing + 8
+    static let toolSpacing: CGFloat = 12
+    static let timePadding: CGFloat = 12
+    static let leadingInset: CGFloat = scaleLabelWidth + scaleLabelSpacing + timePadding
+    static let trailingInset: CGFloat = toolColumnWidth + toolSpacing + timePadding
 
     let containerWidth: CGFloat
-    var minX: CGFloat { Self.leadingInset }
-    var maxX: CGFloat { max(minX + 1, containerWidth - Self.trailingInset) }
+    var canvasMinX: CGFloat { Self.scaleLabelWidth + Self.scaleLabelSpacing }
+    var canvasMaxX: CGFloat { max(canvasMinX + Self.timePadding * 2 + 1, containerWidth - Self.toolColumnWidth - Self.toolSpacing) }
+    var canvasWidth: CGFloat { canvasMaxX - canvasMinX }
+    var minX: CGFloat { canvasMinX + Self.timePadding }
+    var maxX: CGFloat { canvasMaxX - Self.timePadding }
     var width: CGFloat { maxX - minX }
 
     func x(at time: Double, total: Double) -> CGFloat {
@@ -840,6 +846,126 @@ struct EditorTimeAxisGeometry {
     }
 }
 
+private struct EditorAxisDrawing: NSViewRepresentable {
+    enum Kind: Equatable { case canvas, track, grid }
+    let kind: Kind
+    let identifier: String
+    var maximum: Double = 3.05
+
+    func makeNSView(context: Context) -> EditorAxisDrawingView {
+        let view = EditorAxisDrawingView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ view: EditorAxisDrawingView, context: Context) {
+        view.kind = kind
+        view.maximum = maximum
+        view.setAccessibilityIdentifier(identifier)
+        view.setAccessibilityLabel(kind == .canvas ? "编辑画布" : kind == .track ? "视频时间范围" : "倍率时间范围")
+        view.needsDisplay = true
+    }
+}
+
+private final class EditorAxisDrawingView: NSView {
+    var kind: EditorAxisDrawing.Kind = .canvas
+    var maximum = 3.05
+
+    init() {
+        super.init(frame: .zero)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+    }
+
+    required init?(coder: NSCoder) { nil }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        switch kind {
+        case .canvas:
+            let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 12, yRadius: 12)
+            NSColor(AppTheme.paper).setFill()
+            shape.fill()
+            NSColor(AppTheme.line).setStroke()
+            shape.lineWidth = 1
+            shape.stroke()
+        case .track:
+            NSColor(AppTheme.background).setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+        case .grid:
+            let lines = NSBezierPath()
+            for scale in [1.0, 2.0, 3.0] {
+                let y = CGFloat((maximum - scale) / max(0.1, maximum - 1)) * bounds.height
+                lines.move(to: NSPoint(x: 0, y: y))
+                lines.line(to: NSPoint(x: bounds.width, y: y))
+            }
+            lines.lineWidth = 1
+            lines.setLineDash([4, 5], count: 2, phase: 0)
+            NSColor(AppTheme.ink).withAlphaComponent(0.25).setStroke()
+            lines.stroke()
+        }
+    }
+}
+
+private struct EditorScaleLabels: NSViewRepresentable {
+    let maximum: Double
+    let top: CGFloat
+    let bottom: CGFloat
+
+    func makeNSView(context: Context) -> EditorScaleLabelsView { EditorScaleLabelsView() }
+
+    func updateNSView(_ view: EditorScaleLabelsView, context: Context) {
+        view.maximum = maximum
+        view.top = top
+        view.bottom = bottom
+        view.needsLayout = true
+    }
+}
+
+private final class EditorScaleLabelsView: NSView {
+    var maximum = 3.05
+    var top: CGFloat = 16
+    var bottom: CGFloat = 18
+    private let labels = [1, 2, 3].map { scale -> NSTextField in
+        let label = NSTextField(labelWithString: "\(scale).0×")
+        label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        label.textColor = NSColor(AppTheme.ink)
+        label.alignment = .right
+        label.lineBreakMode = .byClipping
+        label.maximumNumberOfLines = 1
+        label.setAccessibilityElement(true)
+        label.setAccessibilityIdentifier("editor.zoomGraph.scaleLabel.\(scale)")
+        return label
+    }
+
+    init() {
+        super.init(frame: .zero)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("倍率标尺")
+        setAccessibilityIdentifier("editor.zoomGraph.scaleLabels")
+        labels.forEach { addSubview($0) }
+        setAccessibilityChildren(labels)
+    }
+
+    required init?(coder: NSCoder) { nil }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        let height = max(1, bounds.height - top - bottom)
+        for (index, label) in labels.enumerated() {
+            let scale = Double(index + 1)
+            let y = top + CGFloat((maximum - scale) / max(0.1, maximum - 1)) * height
+            label.frame = NSRect(x: 0, y: y - 9, width: bounds.width, height: 18)
+        }
+    }
+}
+
 private struct ProductionTimeline: View {
     @ObservedObject var model: EditorModel
     @GestureState private var reorderState: TimelineReorderState?
@@ -852,6 +978,12 @@ private struct ProductionTimeline: View {
             let axis = EditorTimeAxisGeometry(containerWidth: geo.size.width)
             let total = max(0.001, model.totalDuration)
             let layouts = clipLayouts(axis: axis, total: total)
+            EditorAxisDrawing(kind: .canvas, identifier: "editor.timeline.canvas")
+                .frame(width: axis.canvasWidth, height: 57)
+                .position(x: (axis.canvasMinX + axis.canvasMaxX) / 2, y: 59.5)
+            EditorAxisDrawing(kind: .track, identifier: "editor.timeline.dataFrame")
+                .frame(width: axis.width, height: 51)
+                .position(x: (axis.minX + axis.maxX) / 2, y: 59.5)
             ruler(axis: axis, total: total)
                 .frame(width: axis.width, height: 25)
                 .position(x: (axis.minX + axis.maxX) / 2, y: 12.5)
@@ -991,7 +1123,7 @@ private struct ProductionTimeline: View {
             ClipFrameStrip(source: model.sourceURL, start: clip.sourceStart, duration: clip.duration)
             if !selected { Color.black.opacity(0.22) }
         }
-        .frame(width: max(0, width - 3), height: 57)
+        .frame(width: max(0, width - 3), height: 51)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6)
             .strokeBorder(selected ? AppTheme.accent : AppTheme.line, lineWidth: selected ? 2 : 1))
@@ -1137,7 +1269,11 @@ private struct ProductionZoomGraph: View {
                     EditorIcon(symbol: "minus", help: "移除所选放大段（可撤销）", controlHeight: 26) { model.resetZoom() }
                         .accessibilityIdentifier("editor.zoom.reset")
                         .disabled(model.selectedZoom == nil)
-                }.frame(width: EditorTimeAxisGeometry.toolColumnWidth)
+                }
+                .frame(width: EditorTimeAxisGeometry.toolColumnWidth)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("动画编辑工具")
+                .accessibilityIdentifier("editor.zoomGraph.tools")
             }
         }
     }
@@ -1155,20 +1291,15 @@ private struct ProductionZoomGraph: View {
             CGPoint(x: axis.x(at: time, total: total), y: top + CGFloat((maximum - scale) / range) * height)
         }
         return ZStack(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: 12).fill(AppTheme.paper)
-                .padding(.leading, left - 10)
-                .padding(.trailing, EditorTimeAxisGeometry.toolColumnWidth + EditorTimeAxisGeometry.toolSpacing)
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(AppTheme.line)
-                    .padding(.leading, left - 10)
-                    .padding(.trailing, EditorTimeAxisGeometry.toolColumnWidth + EditorTimeAxisGeometry.toolSpacing))
-            axisLabel("1.0×", at: CGPoint(x: 17, y: point(0, 1).y))
-            axisLabel("2.0×", at: CGPoint(x: 17, y: point(0, 2).y))
-            axisLabel("3.0×", at: CGPoint(x: 17, y: point(0, 3).y))
-            Path { path in
-                for scale in [1.0, 2.0, 3.0] {
-                    path.move(to: point(0, scale)); path.addLine(to: point(total, scale))
-                }
-            }.stroke(AppTheme.ink.opacity(0.25), style: StrokeStyle(lineWidth: 1, dash: [4, 5]))
+            EditorAxisDrawing(kind: .canvas, identifier: "editor.zoomGraph.canvas")
+                .frame(width: axis.canvasWidth, height: size.height)
+                .position(x: (axis.canvasMinX + axis.canvasMaxX) / 2, y: size.height / 2)
+            EditorScaleLabels(maximum: maximum, top: top, bottom: bottom)
+                .frame(width: EditorTimeAxisGeometry.scaleLabelWidth, height: size.height)
+                .position(x: EditorTimeAxisGeometry.scaleLabelWidth / 2, y: size.height / 2)
+            EditorAxisDrawing(kind: .grid, identifier: "editor.zoomGraph.dataFrame", maximum: maximum)
+                .frame(width: axis.width, height: height)
+                .position(x: (axis.minX + axis.maxX) / 2, y: top + height / 2)
             effectiveCurve(width: width, total: total, point: point)
                 .stroke(AppTheme.accent.opacity(0.38),
                         style: StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round))
@@ -1324,11 +1455,6 @@ private struct ProductionZoomGraph: View {
                     _ = model.deleteSelected()
                 }.disabled(endpoint || model.isExporting)
             }
-    }
-
-    private func axisLabel(_ text: String, at point: CGPoint) -> some View {
-        Text(text).font(.system(size: 13)).monospacedDigit().foregroundStyle(AppTheme.ink)
-            .position(point)
     }
 
     private func isSelected(_ item: CurveLocation) -> Bool {

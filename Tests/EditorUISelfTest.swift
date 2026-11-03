@@ -163,7 +163,7 @@ enum EditorUISelfTest {
             var fixture = original
             for index in fixture.indices { fixture[index].zooms = [] }
             func zoom(duration: Double) -> ZoomSegment {
-                let points = [CameraKeyframe(time: duration * 0.08, scale: 1),
+                let points = [CameraKeyframe(time: 0, scale: 1),
                     CameraKeyframe(time: duration * 0.3, scale: 1.7),
                     CameraKeyframe(time: duration * 0.7, scale: 2),
                     CameraKeyframe(time: duration * 0.92, scale: 1)]
@@ -193,11 +193,71 @@ enum EditorUISelfTest {
                 window.setFrame(rect, display: true)
                 await settle(0.12)
                 await refreshDisplayedLayout()
+                model.selectedClipID = fixture[0].id; model.selectedZoomID = firstZoom.id
+                await refreshDisplayedLayout()
+                let firstControl = firstZoom.cameraControlPoints[0]
+                let firstNodeID = "editor.zoom.\(firstZoom.id.uuidString).anchor.\(firstControl.id.uuidString)"
+                let firstNodeLocator = try frame(firstNodeID)
+                try await click(at: center(firstNodeLocator), delay: 0.06)
+                try require(model.selectedCameraAnchorIDs == [firstControl.id],
+                            "The actual first endpoint could not be selected for visible halo/label verification.")
+                let timelineCanvas = try actualViewFrame("editor.timeline.canvas")
+                let graphCanvas = try actualViewFrame("editor.zoomGraph.canvas")
+                let timelineData = try actualViewFrame("editor.timeline.dataFrame")
+                let graphData = try actualViewFrame("editor.zoomGraph.dataFrame")
+                let labels = try actualViewFrame("editor.zoomGraph.scaleLabels")
+                let tools = optionalActualAccessibilityFrame("editor.zoomGraph.tools")
+                let firstNode = optionalActualAccessibilityFrame(firstNodeID)
+                let firstNodeOutline = firstNode?.insetBy(dx: -4, dy: -4)
+                try require(abs(timelineCanvas.minX - graphCanvas.minX) <= 1 &&
+                            abs(timelineCanvas.maxX - graphCanvas.maxX) <= 1 &&
+                            abs(timelineData.minX - graphData.minX) <= 1 && abs(timelineData.maxX - graphData.maxX) <= 1,
+                            "Actual drawn timeline/curve canvases or data regions have different visible widths after a \(name) resize.")
+                try require(graphCanvas.minX - labels.maxX >= 12 - 0.01,
+                            "The actual scale-label column leaves less than twelve points to the canvas after a \(name) resize.")
+                if let firstNodeOutline {
+                    try require(!labels.intersects(firstNodeOutline), "The actual label column overlaps the first node's selected outline.")
+                } else {
+                    let note = "SwiftUI node accessibility frames were unavailable. Native clicks verified endpoint selection; selected-halo/label separation requires review of visible-layout-*-first-endpoint.png. Locator frames are computed targets, not measured visible bounds."
+                    if !limitations.contains(note) { limitations.append(note) }
+                }
+                for level in 1...3 {
+                    let label = try actualViewFrame("editor.zoomGraph.scaleLabel.\(level)")
+                    try require(graphCanvas.minX - label.maxX >= 12 - 0.01,
+                                "An actual scale label touches the drawn canvas after a \(name) resize.")
+                    if let firstNodeOutline {
+                        try require(!label.intersects(firstNodeOutline), "An actual scale label touches the first node's selected outline.")
+                    }
+                    resolvedTargets["visible-layout.\(name).scaleLabel.\(level)"] = ["source": "actual native text field accessibility frame",
+                        "windowFrame": NSStringFromRect(label), "canvasGap": String(format: "%.3f", graphCanvas.minX - label.maxX)]
+                }
+                if let tools {
+                    try require(tools.minX >= graphCanvas.maxX - 0.01 && !tools.intersects(graphCanvas),
+                                "The actual right-side tools intrude into the curve canvas after a \(name) resize.")
+                } else {
+                    let note = "SwiftUI toolbar accessibility frames were unavailable; tool/canvas separation requires review of visible-layout-*-first-endpoint.png. No computed toolbar bounds are counted as actual measurements."
+                    if !limitations.contains(note) { limitations.append(note) }
+                }
+                for (id, measurement) in [("timelineCanvas", timelineCanvas), ("curveCanvas", graphCanvas),
+                    ("timelineData", timelineData), ("curveData", graphData), ("scaleLabels", labels)] {
+                    resolvedTargets["visible-layout.\(name).\(id)"] = ["source": "actual native view/accessibility frame; no layout fallback",
+                        "windowFrame": NSStringFromRect(measurement)]
+                }
+                for (id, measurement) in [("tools", tools), ("firstNode", firstNode), ("firstNodeOutline", firstNodeOutline)] {
+                    if let measurement {
+                        resolvedTargets["visible-layout.\(name).\(id)"] = ["source": "actual accessibility frame; no layout fallback",
+                            "windowFrame": NSStringFromRect(measurement)]
+                    }
+                }
+                resolvedTargets["visible-layout.\(name).firstNodeClickTarget"] = ["source": "input locator only; native click verified selected ID; not measured visible bounds",
+                    "windowFrame": NSStringFromRect(firstNodeLocator)]
+                try screenshot("visible-layout-\(name)-first-endpoint")
                 let ruler = try frame("editor.timeline.ruler")
                 let graph = try frame("editor.zoomGraph")
                 let axis = EditorTimeAxisGeometry(containerWidth: graph.width)
                 try require(abs(ruler.minX - graph.minX - axis.minX) <= 1 &&
-                            abs(ruler.maxX - graph.minX - axis.maxX) <= 1,
+                            abs(ruler.maxX - graph.minX - axis.maxX) <= 1 &&
+                            abs(ruler.minX - timelineData.minX) <= 1 && abs(ruler.maxX - timelineData.maxX) <= 1,
                             "The ruler and curve plot have different visible time ranges after a \(name) resize.")
                 let timeTolerance = max(0.002, total * 1.1 / Double(max(1, ruler.width)))
                 for fraction in [0.15, 0.5, 0.85] {
@@ -248,7 +308,7 @@ enum EditorUISelfTest {
                 try require(model.clips == fixture, "One Undo did not restore the axis-alignment node drag.")
                 try screenshot("time-axis-\(name)")
                 record("shared-time-axis-\(name)", began,
-                       "Ruler-based native clicks, two clips' actual curve nodes and a horizontal node drag agreed with the playhead within one point at window size \(window.frame.size).")
+                       "Actual native canvas/data/text frames matched and labels kept a twelve-point gap; missing virtual node/tool bounds require the recorded screenshot review. Ruler clicks, curve nodes and dragging agreed within one point at window size \(window.frame.size).")
             }
             window.setFrame(previousFrame, display: true)
             model.clips = original; model.selectedClipID = previousClipID; model.selectedZoomID = previousZoomID
@@ -1720,6 +1780,45 @@ enum EditorUISelfTest {
                                "isActive": "\(NSApp.isActive)", "isKeyWindow": "\(window.isKeyWindow)",
                                "eventCount": "\(sequence.count)"])
             }
+        }
+
+        func actualViewFrame(_ identifier: String) throws -> NSRect {
+            guard let view = accessibilityElements().compactMap({ $0 as? NSView }).first(where: {
+                $0.accessibilityIdentifier() == identifier && $0.window === window
+            }), !view.isHiddenOrHasHiddenAncestor else {
+                throw failure("Missing actual visible native view for \(identifier); visible-layout evidence cannot use a computed fallback.")
+            }
+            let drawnBounds = view.convert(view.bounds, to: nil)
+            let actual = try actualAccessibilityFrame(identifier)
+            try require(view.visibleRect.width > 0 && view.visibleRect.height > 0 &&
+                        abs(actual.minX - drawnBounds.minX) <= 1 && abs(actual.maxX - drawnBounds.maxX) <= 1 &&
+                        abs(actual.minY - drawnBounds.minY) <= 1 && abs(actual.maxY - drawnBounds.maxY) <= 1,
+                        "Native view bounds and its actual accessibility frame disagree for \(identifier): bounds=\(drawnBounds), AX=\(actual).")
+            resolvedTargets[identifier] = ["source": "actual native NSView drawing bounds verified against accessibility",
+                "viewClass": String(describing: type(of: view)), "windowFrame": NSStringFromRect(actual)]
+            return actual
+        }
+
+        func optionalActualAccessibilityFrame(_ identifier: String) -> NSRect? {
+            guard let item = accessibilityElements().first(where: { $0.accessibilityIdentifier() == identifier }) else { return nil }
+            let rect = window.convertFromScreen(item.accessibilityFrame())
+            guard rect.width > 0, rect.height > 0, rect.minX.isFinite, rect.minY.isFinite,
+                  rect.maxX.isFinite, rect.maxY.isFinite else { return nil }
+            resolvedTargets[identifier] = ["source": "actual accessibility frame; no layout fallback", "windowFrame": NSStringFromRect(rect)]
+            return rect
+        }
+
+        func actualAccessibilityFrame(_ identifier: String) throws -> NSRect {
+            guard let item = accessibilityElements().first(where: { $0.accessibilityIdentifier() == identifier }) else {
+                throw failure("Missing actual accessibility element for \(identifier); visible-layout evidence cannot use a computed fallback.")
+            }
+            let rect = window.convertFromScreen(item.accessibilityFrame())
+            guard rect.width > 0, rect.height > 0, rect.minX.isFinite, rect.minY.isFinite,
+                  rect.maxX.isFinite, rect.maxY.isFinite else {
+                throw failure("Invalid actual accessibility frame for \(identifier): \(rect).")
+            }
+            resolvedTargets[identifier] = ["source": "actual accessibility frame; no layout fallback", "windowFrame": NSStringFromRect(rect)]
+            return rect
         }
 
         func frame(_ identifier: String) throws -> NSRect {
