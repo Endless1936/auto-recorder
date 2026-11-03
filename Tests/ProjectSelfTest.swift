@@ -294,6 +294,26 @@ enum ProjectSelfTest {
         bounded.setLocalFramingCenter(x: 0.52, y: 0.48, at: 2.5, visibleStart: 2, visibleEnd: 6)
         try check(bounded.localCenterEdits?.first?.start == 2 && bounded.localCenterEdits?.first?.end == 3,
                   "局部修正越过剪切边界或中间全景节点")
+        for automatic in [false, true] {
+            let base = ZoomSegment(start: 0, riseEnd: 1, fallStart: 7, end: 8, peak: 2,
+                centerPath: automatic ? (0...240).map { ZoomCenterPoint(time: Double($0) / 30, x: 0.5, y: 0.5) } : [],
+                manualFocus: !automatic)
+            var corrected = base
+            _ = corrected.addCameraKeyframe(at: 2)
+            _ = corrected.addCameraKeyframe(at: 4)
+            corrected.setLocalFramingCenter(x: 0.58, y: 0.46, at: 2.5, visibleStart: 0, visibleEnd: 8)
+            corrected.setLocalFramingCenter(x: 0.47, y: 0.53, at: 4, visibleStart: 0, visibleEnd: 8)
+            let ids = Set(corrected.cameraControlPoints.filter { $0.time == 2 || $0.time == 4 }.map(\.id))
+            var moved = corrected
+            moved.moveCameraKeyframes(ids: ids, timeDelta: 0.2, scaleDelta: 0)
+            try check(moved.localCenterEdits == corrected.localCenterEdits && moved.centerPath == corrected.centerPath,
+                      "移动倍率节点改写了局部取景修正或原始运动")
+            for i in 0...1920 {
+                let t = Double(i) / 240, a = corrected.pose(at: t), b = moved.pose(at: t)
+                try check(abs(a.x - b.x) < 1e-8 && abs(a.y - b.y) < 1e-8 && abs(a.scale - b.scale) < 1e-8,
+                          "批量移动等倍率节点重复叠加了局部取景位移")
+            }
+        }
         print("PASS local framing: exact center, smooth one-second falloff, unchanged outside/scale/original, repeat and overlapping drags, edge clamps, full-view/cut boundaries, JSON and shifted cuts")
     }
 
@@ -1399,6 +1419,34 @@ enum ProjectSelfTest {
         }
 
         let originalClips = model.clips
+        let originalPose = model.activePose
+        let originalPlayerItem = model.player.currentItem
+        var resizingID: UUID?
+        model.beginFramingEditing()
+        for scale in [1.0, 2.4, 1.05, 2.7, 1.0, 2.4] {
+            model.updateFramingScale(scale)
+            let value = model.activePose, margin = 0.5 / scale
+            try check(abs(value.scale - scale) < 1e-8 &&
+                      abs(value.x - min(1 - margin, max(margin, originalPose.x))) < 1e-8 &&
+                      abs(value.y - min(1 - margin, max(margin, originalPose.y))) < 1e-8,
+                      "反复缩放取景框时中心逐渐漂移")
+            let point = model.selectedZoom!.cameraControlPoints.first { abs($0.time - model.activeLocalTime) < 1e-6 }!
+            if let resizingID { try check(point.id == resizingID, "同次缩放拖动反复替换倍率节点身份") }
+            resizingID = point.id
+        }
+        model.endEditing()
+        try check(model.player.currentItem === originalPlayerItem && (model.selectedZoom?.localCenterEdits?.count ?? 0) <= 1,
+                  "一次反复缩放替换了原片播放器或累积多个修正")
+        model.undo()
+        try check(model.clips == originalClips && !model.canUndo, "反复缩放未由一次撤销恢复")
+        model.beginFramingEditing()
+        model.updateFramingScale(1)
+        model.updateFramingScale(2.8)
+        model.updateFramingScale(originalPose.scale)
+        model.endEditing()
+        try check(model.clips == originalClips && !model.canUndo,
+                  "取景框缩放后拖回原位留下了修改或多余撤销记录")
+        print("PASS framing resize gestures: original-center recovery across full view, stable node identity, one correction/Undo, exact drag-back cancellation and raw player retention")
         let framingPlayerItem = model.player.currentItem
         model.beginEditing()
         model.updateFramingCenter(x: 0.67, y: 0.39)
