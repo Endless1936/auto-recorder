@@ -442,7 +442,8 @@ enum EditorUISelfTest {
             try require(model.clips != original &&
                         (model.selectedZoom?.centerPath != beforeFrameZoom?.centerPath ||
                          model.selectedZoom?.manualCenterPath != beforeFrameZoom?.manualCenterPath ||
-                         model.selectedZoom?.centerOffsets != beforeFrameZoom?.centerOffsets) &&
+                         model.selectedZoom?.centerOffsets != beforeFrameZoom?.centerOffsets ||
+                         model.selectedZoom?.localCenterEdits != beforeFrameZoom?.localCenterEdits) &&
                         (model.selectedZoom?.centerPath.isEmpty == false || model.selectedZoom?.manualCenterPath?.isEmpty == false),
                         "Native framing-frame drag did not change and retain the selected zoom's center path.")
             try require(try persistedClips() == model.clips, "Native frame drag was not saved in project.json.")
@@ -457,40 +458,10 @@ enum EditorUISelfTest {
             record("framing-frame-drag-save-and-single-undo", began,
                    "Native frame drag changed the persisted center path; one native Command-Z restored exact clip/zoom content and playback position.")
 
-            began = Date()
-            let preview = try frame("editor.preview.surface")
-            var handleTarget: (handle: ZoomCenterPoint, point: NSPoint)?
-            for (index, handle) in (model.framingState?.handles ?? []).enumerated() {
-                guard (model.selectedZoom?.scale(at: handle.time) ?? 1) > 1.000001 else { continue }
-                let point = center(try frame("editor.framing.handle.\(index)"))
-                if point.y > preview.minY + 60 && preview.insetBy(dx: 14, dy: 14).contains(point) {
-                    handleTarget = (handle, point)
-                    break
-                }
-            }
-            guard let handleTarget else {
-                throw failure("Framing assistance did not expose any path handles.")
-            }
-            let handleGrab = handleTarget.point
-            let handleDX = source.width * (handleTarget.handle.x <= 0.5 ? 0.045 : -0.045)
-            let beforeHandleZoom = model.selectedZoom
-            try await drag(from: handleGrab, to: NSPoint(x: handleGrab.x + handleDX, y: handleGrab.y))
-            try require(model.clips != original &&
-                        (model.selectedZoom?.centerPath != beforeHandleZoom?.centerPath ||
-                         model.selectedZoom?.manualCenterPath != beforeHandleZoom?.manualCenterPath ||
-                         model.selectedZoom?.centerOffsets != beforeHandleZoom?.centerOffsets),
-                        "Native path-handle drag did not change the selected zoom's center path.")
-            try require(try persistedClips() == model.clips, "Native path-handle drag was not saved in project.json.")
-            try screenshot("framing-path-handle-drag")
-            try await undo()
-            try require(model.clips == original && abs(model.playhead - pausedTime) < 0.02,
-                        "One native Command-Z did not restore path-handle content and paused time.")
-            try require(try persistedClips() == original, "Path-handle Undo did not restore the saved project.")
-            try await waitUntil("Framing assistance did not recover after path-handle Undo.") {
-                self.model.framingState?.canEdit == true
-            }
-            record("framing-path-handle-save-and-single-undo", began,
-                   "Native path-handle drag changed the persisted center path and one native Command-Z restored it exactly.")
+            try require(!accessibilityElements().contains {
+                let id = $0.accessibilityIdentifier() ?? ""
+                return id == "editor.framing.path" || id.hasPrefix("editor.framing.handle.")
+            }, "The simplified preview still exposes hidden path lines or numbered motion handles.")
 
             began = Date()
             let playbackBegan = Date()
@@ -608,7 +579,7 @@ enum EditorUISelfTest {
                 guard let edited = model.clips[targetIndex].zooms.first(where: { $0.id == target.id }) else {
                     throw failure("Visible-frame drag removed its actual target zoom.")
                 }
-                try require(edited != target && edited.manualCenterPath?.isEmpty == false,
+                try require(edited != target && edited.localCenterEdits?.count == 1 && edited.centerPath == target.centerPath && edited.manualCenterPath == target.manualCenterPath,
                             "Native frame drag with stale selection did not change its active motion path.")
                 var expected = fixture
                 expected[targetIndex].zooms = expected[targetIndex].zooms.map { $0.id == target.id ? edited : $0 }
@@ -748,13 +719,8 @@ enum EditorUISelfTest {
                    "Native corner shrinks/expansions set different earlier/later magnifications; moving the first frame changed its path, resize Undo and reopening retained exact data without replacing raw video.")
 
             began = Date()
-            guard let firstHandleIndex = model.framingState?.handles.firstIndex(where: { abs($0.time - firstTime) < 0.001 }) else {
-                throw failure("An added earlier anchor was not exposed as a numbered path handle.")
-            }
-            try await click("editor.framing.handle.\(firstHandleIndex)")
-            try require(abs(model.activeLocalTime - firstTime) < 0.02 &&
-                        abs(model.activePose.scale - firstScaleAfterRedo) < 0.02,
-                        "Clicking a numbered path handle did not preview its corresponding time and magnification.")
+            try await seekUsingRuler(fraction: CGFloat((model.startTime(of: fixture[targetIndex].id) + firstTime) / model.totalDuration))
+            try await click("editor.zoom.\(zoom.id.uuidString).anchor.\(first.id.uuidString)")
             let beforeCurve = model.clips
             let curveStart = center(try frame("editor.zoom.\(zoom.id.uuidString).anchor.\(first.id.uuidString)"))
             let newTime = firstTime + duration * 0.04
@@ -770,8 +736,8 @@ enum EditorUISelfTest {
             try screenshot("framing-curve-anchor-edit")
             try await undo()
             try require(model.clips == beforeCurve, "One native Undo did not restore the curve-anchor edit.")
-            record("framing-numbered-path-selection-and-curve-bridge", began,
-                   "Selecting a numbered path point sought its time; dragging its curve point changed independent time/magnification and the live frame, with one saved Undo.")
+            record("framing-curve-selection-and-preview-bridge", began,
+                   "Seeking to the earlier time and selecting its curve point, then dragging it changed independent time/magnification and the live frame, with one saved Undo.")
 
             began = Date()
             let secondCurve = center(try frame("editor.zoom.\(zoom.id.uuidString).anchor.\(second.id.uuidString)"))
@@ -868,61 +834,35 @@ enum EditorUISelfTest {
                 self.model.isFramingPreviewReady && self.model.framingState?.handles.count == controls.count
             }
 
-            let coincident = Array(repeating: CGPoint(x: 150, y: 150), count: 6)
-            let badges = FramingOverlayGeometry.handleBadgeCenters(points: coincident,
-                bounds: CGRect(x: 0, y: 0, width: 300, height: 300))
-            for index in badges.indices {
-                try require(FramingOverlayGeometry.badgeIndex(at: badges[index], centers: badges) == index,
-                            "Coincident centers do not retain independently hittable numbered badges.")
-            }
-
-            let identifier = try cameraHandleIdentifier(at: control.time)
-            try await click(identifier)
-            try require(model.selectedClipID == clipID && model.selectedZoomID == zoom.id &&
-                        model.editingSelectionTarget == .cameraAnchors &&
-                        model.selectedCameraAnchorIDs == [control.id] &&
-                        abs(model.activeLocalTime - control.time) < 0.02,
-                        "Clicking an automatic path badge did not select and seek its matching curve control.")
-            _ = try frame("editor.zoom.\(zoom.id.uuidString).node.\(target)")
-            let grab = center(try frame(identifier))
+            try await seekUsingRuler(fraction: CGFloat((offset + control.time) / model.totalDuration))
+            let before = model.activePose
+            let grab = try framingFrameGrabPoint()
             let source = try framingSourceFrame()
-            let before = zoom.pose(at: control.time)
             let dx = source.width * (before.x <= 0.5 ? 0.045 : -0.045)
             try await dragFramingSlowly(from: grab, to: NSPoint(x: grab.x + dx, y: grab.y))
-            guard let edited = model.selectedZoom, let state = model.framingState else {
-                throw failure("Dragging an automatic circle control lost its selected segment or overlay.")
+            guard let edited = model.selectedZoom, let patch = edited.localCenterEdits?.last else {
+                throw failure("The native frame drag did not save a local correction.")
             }
-            try require(edited.centerPath == path && !edited.manualFocus && edited.centerOffsets?.isEmpty == false,
-                        "A native automatic-path drag overwrote its original dense center path or failed to store a correction.")
-            try require(model.selectedClipID == clipID && model.selectedZoomID == zoom.id &&
-                        model.selectedCameraAnchorIDs == [control.id] &&
-                        abs(model.activeLocalTime - control.time) < 0.02 &&
+            try require(edited.centerPath == path && !edited.manualFocus && edited.cameraKeyframes == nil &&
+                        (edited.localCenterEdits?.count ?? 0) == 1 &&
                         abs(edited.pose(at: control.time).x - before.x) > 0.02,
-                        "A held native drag changed node identity/time or failed to move its selected control.")
-            for neighbor in [controls[target - 1].time, controls[target + 1].time] {
-                let middle = (neighbor + control.time) / 2
-                let oldMiddle = zoom.pose(at: middle), newMiddle = edited.pose(at: middle)
-                try require(abs(newMiddle.x - oldMiddle.x) > 0.003,
-                            "Automatic control movement affected only one dense frame instead of its adjacent interval.")
-                let oldBoundary = zoom.pose(at: neighbor), newBoundary = edited.pose(at: neighbor)
-                try require(abs(newBoundary.x - oldBoundary.x) < 0.000001 &&
-                            abs(newBoundary.y - oldBoundary.y) < 0.000001,
-                            "Local automatic movement displaced an unchanged neighboring control.")
+                        "The native drag accumulated events, changed original motion or failed to move the current frame.")
+            for time in stride(from: 0.0, through: duration, by: 1.0 / 120) {
+                let old = zoom.pose(at: time), new = edited.pose(at: time)
+                if time <= patch.start || time >= patch.end {
+                    try require(abs(old.x - new.x) < 1e-8 && abs(old.y - new.y) < 1e-8 && old.scale == new.scale,
+                                "A local frame drag changed footage outside its temporal support.")
+                }
             }
-            for handle in state.handles {
-                try require(state.pathSamples.contains(where: {
-                    abs($0.time - handle.time) < 0.000001 &&
-                        abs($0.x - handle.x) < 0.000001 && abs($0.y - handle.y) < 0.000001
-                }), "The visible automatic route missed an exact numbered control center.")
-            }
-            try require(try persistedClips() == model.clips, "The native automatic-path correction was not saved.")
-            try screenshot("framing-automatic-\(scenario)-control-drag")
+            try require(try persistedClips() == model.clips &&
+                        !accessibilityElements().contains { ($0.accessibilityIdentifier() ?? "").hasPrefix("editor.framing.handle.") },
+                        "The correction was not saved or the preview retained numbered motion handles.")
+            try screenshot("framing-automatic-\(scenario)-local-drag")
             try await undo()
-            let savedUndo = try persistedClips()
-            try require(model.clips == fixture && savedUndo == fixture,
-                        "One native Undo did not restore the exact automatic circle and its saved data.")
-            record("framing-automatic-\(scenario)-numbered-control-drag", began,
-                   "A 30 Hz \(scenario) route exposed real controls; native badge selection and a held mouse drag retained curve identity and original samples, changed both adjacent intervals, kept every handle on the displayed path and saved one undoable correction.")
+            try require(model.clips == fixture && (try persistedClips()) == fixture,
+                        "One native Undo did not restore the exact automatic motion.")
+            record("framing-automatic-\(scenario)-local-frame-drag", began,
+                   "A held native frame drag saved exactly one smooth local correction over intact dense motion; samples outside its window stayed unchanged and one Undo restored all data.")
 
             try await click("editor.framing.toggle")
             try await waitUntil("The automatic circle did not restore processed preview.") {
@@ -1656,10 +1596,11 @@ enum EditorUISelfTest {
         }
 
         func cameraHandleIdentifier(at time: Double) throws -> String {
-            guard let index = model.framingState?.handles.firstIndex(where: { abs($0.time - time) < 0.000001 }) else {
-                throw failure("The requested movement time is not exposed as a native path badge.")
+            guard let zoom = model.selectedZoom,
+                  let point = zoom.cameraControlPoints.first(where: { abs($0.time - time) < 0.000001 }) else {
+                throw failure("The requested time has no curve control.")
             }
-            return "editor.framing.handle.\(index)"
+            return "editor.zoom.\(zoom.id.uuidString).anchor.\(point.id.uuidString)"
         }
 
         func requireTimelineFocus(_ clipID: UUID, selected: Bool) throws {
@@ -1675,13 +1616,9 @@ enum EditorUISelfTest {
         func framingFrameGrabPoint() throws -> NSPoint {
             let crop = try frame("editor.framing.frame")
             let preview = try frame("editor.preview.surface")
-            let handles = try (model.framingState?.handles.indices ?? 0..<0).map {
-                try frame("editor.framing.handle.\($0)").insetBy(dx: -3, dy: -3)
-            }
             for (x, y) in [(0.3, 0.7), (0.7, 0.7), (0.3, 0.4), (0.7, 0.4), (0.5, 0.7)] {
                 let point = NSPoint(x: crop.minX + crop.width * x, y: crop.minY + crop.height * y)
-                if point.y > preview.minY + 60 && crop.insetBy(dx: 8, dy: 8).contains(point) &&
-                    !handles.contains(where: { $0.contains(point) }) { return point }
+                if point.y > preview.minY + 60 && crop.insetBy(dx: 8, dy: 8).contains(point) { return point }
             }
             throw failure("No framing-frame interior target avoids path handles and preview controls.")
         }

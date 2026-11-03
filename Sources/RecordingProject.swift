@@ -8,6 +8,10 @@ struct DemoZoomPose: Equatable, Sendable {
     var y: Double = 0.5
 }
 
+enum CameraPositionTiming: String, Codable, Sendable {
+    case smooth, linear, viewport
+}
+
 struct ZoomCenterPoint: Codable, Equatable, Sendable {
     var time: Double
     var x: Double
@@ -63,8 +67,8 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     var cameraKeyframes: [CameraKeyframe]?
     var centerOffsets: [CameraCenterOffset]?
     var centerPanSpans: [CameraPanSpan]?
-    // New automatic paths ease viewport size and center together. Older authored
-    // documents retain their original magnification interpolation.
+    var localCenterEdits: [CameraLocalOffset]? = nil
+    // Retained only to reopen authored projects from earlier camera planners.
     var simpleMotion: Bool?
     var positionMotion: Bool?
 
@@ -136,7 +140,8 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     var preferredFramingSampleTimes: [Double] {
         let times = centerPath.map(\.time) + (manualCenterPath ?? []).map(\.time) +
             cameraControlPoints.map(\.time) + (centerOffsets ?? []).map(\.time) +
-            (centerPanSpans ?? []).flatMap { [$0.start, $0.end] }
+            (centerPanSpans ?? []).flatMap { [$0.start, $0.end] } +
+            (localCenterEdits ?? []).flatMap { [$0.start, $0.time, $0.end] }
         return Array(Set(times.filter(\.isFinite))).sorted()
     }
 
@@ -269,7 +274,9 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     }
 
     private mutating func moveCenterControl(from oldTime: Double, to newTime: Double) {
-        let value = pose(at: oldTime)
+        var baseMotion = self
+        baseMotion.localCenterEdits = nil
+        let value = baseMotion.pose(at: oldTime)
         splitCenterPans(at: oldTime)
         moveCenterPanEndpoints(from: oldTime, to: newTime, x: value.x, y: value.y)
         if !manualFocus, !centerPath.isEmpty {
@@ -409,6 +416,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         result.cameraKeyframes = cameraKeyframes?.map { var point = $0; point.time += offset; return point }
         result.centerOffsets = centerOffsets?.map { var point = $0; point.time += offset; return point }
         result.centerPanSpans = centerPanSpans?.map { var span = $0; span.start += offset; span.end += offset; return span }
+        result.localCenterEdits = localCenterEdits?.map { $0.shifted(by: offset) }
         return result
     }
 
@@ -462,7 +470,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         return delta * 6 * t * (1 - t) / (b - a)
     }
 
-    func pose(at time: Double) -> DemoZoomPose {
+    private func unclampedCenter(at time: Double) -> (Double, Double) {
         let scale = self.scale(at: time)
         var center: (Double, Double)
         if let path = manualCenterPath, !path.isEmpty, manualFocus || centerPath.isEmpty {
@@ -481,6 +489,16 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             let value = pan.sample(at: time)
             center = (value.x, value.y)
         }
+        for edit in localCenterEdits ?? [] {
+            let weight = edit.weight(at: time)
+            center.0 += edit.x * weight; center.1 += edit.y * weight
+        }
+        return center
+    }
+
+    func pose(at time: Double) -> DemoZoomPose {
+        let scale = self.scale(at: time)
+        let center = unclampedCenter(at: time)
         let margin = 0.5 / scale
         return DemoZoomPose(scale: scale,
                             x: min(1 - margin, max(margin, center.0)),
@@ -504,6 +522,29 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
             }
         }
         return centerPath
+    }
+
+    mutating func setLocalFramingCenter(x: Double, y: Double, at time: Double,
+                                      visibleStart: Double, visibleEnd: Double) {
+        guard [x, y, time, visibleStart, visibleEnd].allSatisfy(\.isFinite),
+              time >= visibleStart, time <= visibleEnd, scale(at: time) > 1.000001 else { return }
+        let fullViews = cameraControlPoints.filter { $0.scale <= 1.000001 }.map(\.time)
+        let lower = max(visibleStart, start, time - 1,
+                        fullViews.filter { $0 < time }.max() ?? start)
+        let upper = min(visibleEnd, end, time + 1,
+                        fullViews.filter { $0 > time }.min() ?? end)
+        guard upper > lower else { return }
+        // Replace a correction at this time, rather than stacking mouse events.
+        localCenterEdits = localCenterEdits?.filter { abs($0.time - time) > 0.000001 }
+        let base = unclampedCenter(at: time), margin = 0.5 / scale(at: time)
+        let dx = min(1 - margin, max(margin, x)) - base.0
+        let dy = min(1 - margin, max(margin, y)) - base.1
+        if abs(dx) > 1e-9 || abs(dy) > 1e-9 {
+            var edits = localCenterEdits ?? []
+            edits.append(CameraLocalOffset(start: lower, time: time, end: upper, x: dx, y: dy))
+            localCenterEdits = edits.sorted { $0.time < $1.time }
+        }
+        if localCenterEdits?.isEmpty == true { localCenterEdits = nil }
     }
 
     mutating func setFramingCenter(x: Double, y: Double, at time: Double) {
@@ -598,6 +639,11 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
 
     func normalized() -> ZoomSegment {
         var result = self
+        result.localCenterEdits = result.localCenterEdits?.filter {
+            [$0.start, $0.time, $0.end, $0.x, $0.y].allSatisfy(\.isFinite) &&
+            $0.start <= $0.time && $0.time <= $0.end && $0.end > $0.start
+        }.sorted { $0.time < $1.time }
+        if result.localCenterEdits?.isEmpty == true { result.localCenterEdits = nil }
         if !result.start.isFinite { result.start = 0 }
         if !result.riseEnd.isFinite { result.riseEnd = result.start }
         if !result.fallStart.isFinite { result.fallStart = result.riseEnd }
@@ -903,7 +949,6 @@ enum ProjectStore {
 
     static func automaticZooms(trace: CursorTrace, duration: Double, fps: Int32) -> [ZoomSegment] {
         guard duration.isFinite, duration > 0, fps > 0, trace.hasClicks else { return [] }
-        let planningTrace = CursorTrace(samples: trace.samples.filter { $0.time >= 0 && $0.time <= duration })
         let plan = AutoZoomPlan(trace: trace, duration: duration, fps: min(30, Int(fps)))
         let step = 1 / Double(plan.fps)
         let count = min(plan.poses.count, Int(floor(duration * Double(plan.fps))) + 1)
@@ -932,31 +977,10 @@ enum ProjectStore {
             let path = (max(0, first - 1)...min(plan.poses.count - 1, last + 1)).map {
                 ZoomCenterPoint(time: Double($0) * step, x: plan.poses[$0].x, y: plan.poses[$0].y)
             }
-            let original = ZoomSegment(start: start, riseEnd: Double(rise) * step, fallStart: fallTime,
+            return ZoomSegment(start: start, riseEnd: Double(rise) * step, fallStart: fallTime,
                 end: end, peak: peak, focusX: plan.poses[rise].x, focusY: plan.poses[rise].y,
                 centerPath: path).normalized()
-            return simplifiedMotion(original, trace: planningTrace, fps: Int(fps))
         }
-    }
-
-    static func simplifiedMotion(_ original: ZoomSegment, trace: CursorTrace, fps: Int) -> ZoomSegment {
-        let times = [original.start, original.riseEnd, original.fallStart, original.end]
-        let referenceTimes = Array(Set(original.centerPath.map(\.time) + times)).sorted()
-        let reference = referenceTimes.map { time -> CameraPositionWaypoint in
-            let pose = original.pose(at: time)
-            return CameraPositionWaypoint(time: time, x: pose.x, y: pose.y)
-        }
-        let points = SimplifiedCameraPath.plan(trace: trace, reference: reference,
-            mandatoryTimes: times, scaleAt: { original.scale(at: $0) }, fps: fps)
-        var result = original
-        result.simpleMotion = nil
-        result.positionMotion = true
-        result.manualFocus = true
-        result.manualCenterPath = points.map { ZoomCenterPoint(time: $0.time, x: $0.x, y: $0.y, timing: $0.timing) }
-        result.cameraKeyframes = nil
-        result.centerOffsets = nil
-        result.centerPanSpans = nil
-        return result.normalized()
     }
 }
 
@@ -1322,7 +1346,7 @@ final class EditorModel: ObservableObject {
             (pose.y * totalWeight - others.reduce(0) { $0 + $1.y * max(0, $1.scale - 1) }) / selectedWeight : 0.5
         guard let point = zoom.addCameraKeyframe(at: time) else { return }
         zoom.updateCameraKeyframe(id: point.id, time: point.time, scale: targetScale)
-        zoom.setFramingCenter(x: centerX, y: centerY, at: time)
+        zoom.setLocalFramingCenter(x: centerX, y: centerY, at: time, visibleStart: 0, visibleEnd: clip.duration)
         setZoom(zoom, for: clip.id)
         markMotionPoint(at: point.time, in: clip.id, zoomID: zoom.id)
         if requested < otherMaximum - 0.000001 { message = "其他重叠放大段限制当前倍率" }
@@ -1474,7 +1498,22 @@ final class EditorModel: ObservableObject {
     }
 
     func updateFramingCenter(clipID: UUID, zoomID: UUID, time: Double, x: Double, y: Double) {
-        updateFramingKeyframe(clipID: clipID, zoomID: zoomID, time: time, x: x, y: y)
+        guard x.isFinite, y.isFinite, let target = framingTarget(clipID: clipID, zoomID: zoomID, time: time),
+              target.zoom.scale(at: time) > 1.000001 else { return }
+        let clip = target.clip
+        // Each mouse event starts from the gesture's snapshot. Overlapping edits
+        // from earlier gestures remain, but a held drag produces one correction.
+        var zoom = editingSnapshot?.clips.first(where: { $0.id == clipID })?.zooms.first(where: { $0.id == zoomID }) ?? target.zoom
+        let pose = clip.pose(at: time), margin = 0.5 / pose.scale
+        let nextX = min(1 - margin, max(margin, x)), nextY = min(1 - margin, max(margin, y))
+        let selectedWeight = zoom.scale(at: time) - 1
+        let others = clip.zooms.filter { $0.id != zoomID }.map { $0.pose(at: time) }
+        let totalWeight = selectedWeight + others.reduce(0) { $0 + max(0, $1.scale - 1) }
+        let centerX = (nextX * totalWeight - others.reduce(0) { $0 + $1.x * max(0, $1.scale - 1) }) / selectedWeight
+        let centerY = (nextY * totalWeight - others.reduce(0) { $0 + $1.y * max(0, $1.scale - 1) }) / selectedWeight
+        zoom.setLocalFramingCenter(x: centerX, y: centerY, at: time, visibleStart: 0, visibleEnd: clip.duration)
+        setZoom(zoom, for: clipID)
+        clearCameraAnchorSelection()
     }
 
     func updateFramingKeyframe(time: Double, x: Double, y: Double) {
@@ -2008,6 +2047,7 @@ final class EditorModel: ObservableObject {
         zoom.manualCenterPath = nil
         zoom.centerOffsets = nil
         zoom.centerPanSpans = nil
+        zoom.localCenterEdits = nil
         setZoom(zoom, for: clip.id)
     }
 

@@ -1,5 +1,30 @@
 import Foundation
 
+/// Compact, time-local correction over the retained motion. The weight and its
+/// first derivative vanish at both ends, so adjacent footage keeps its motion.
+struct CameraLocalOffset: Codable, Equatable, Sendable {
+    var start: Double
+    var time: Double
+    var end: Double
+    var x: Double
+    var y: Double
+
+    func weight(at value: Double) -> Double {
+        guard value >= start, value <= end else { return 0 }
+        if abs(value - time) < 1e-12 { return 1 }
+        let distance = value < time ? (time - value) / max(1e-12, time - start)
+            : (value - time) / max(1e-12, end - time)
+        let t = min(1, max(0, distance))
+        return 1 - t * t * (3 - 2 * t)
+    }
+
+    func shifted(by delta: Double) -> CameraLocalOffset {
+        var value = self
+        value.start += delta; value.time += delta; value.end += delta
+        return value
+    }
+}
+
 /// A smooth correction relative to the retained automatic center path.
 struct CameraCenterOffset: Codable, Equatable, Sendable {
     var time: Double

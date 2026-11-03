@@ -135,6 +135,7 @@ enum ProjectSelfTest {
     }
 
     static func runLogic() throws {
+        try checkLocalFramingCorrection()
         try checkSimpleCameraInterpolation()
         try checkPositionOnlyCameraInterpolation()
         try checkCameraKeyframes()
@@ -244,6 +245,56 @@ enum ProjectSelfTest {
                   repairedZoom.riseEnd < repairedZoom.fallStart && repairedZoom.fallStart < repairedZoom.end,
                   "重开时没有修复退化时序，或错误重新生成了用户镜头")
         print("PASS saved control repair: degenerate timing repaired without replacing camera identity, amplitude or pointer trace")
+    }
+
+    private static func checkLocalFramingCorrection() throws {
+        let path = (0...240).map { index in
+            let t = Double(index) / 30
+            return ZoomCenterPoint(time: t, x: 0.5 + 0.035 * sin(t * 4), y: 0.5 + 0.03 * cos(t * 3))
+        }
+        let original = ZoomSegment(start: 0, riseEnd: 1, fallStart: 7, end: 8, peak: 1.8, centerPath: path)
+        var edited = original
+        let time = 4.2, before = original.pose(at: time)
+        edited.setLocalFramingCenter(x: before.x + 0.06, y: before.y - 0.04, at: time, visibleStart: 0, visibleEnd: 8)
+        try check(edited.centerPath == path && edited.cameraKeyframes == nil && edited.localCenterEdits?.count == 1,
+                  "局部拖框修改了原始轨迹、创建多余曲线点或没有保存局部修正")
+        let decoded = try JSONDecoder().decode(ZoomSegment.self, from: JSONEncoder().encode(edited))
+        let shifted = decoded.shifted(by: -2.3).normalized()
+        try check(decoded == edited, "局部取景修正未完整保存")
+        for i in 0...1920 {
+            let t = Double(i) / 240
+            let base = original.pose(at: t), actual = decoded.pose(at: t), cut = shifted.pose(at: t - 2.3)
+            let distance = abs(t - time)
+            let d = min(1, distance)
+            let weight = distance < 1 ? 1 - d * d * (3 - 2 * d) : 0
+            try check(abs(actual.x - base.x - 0.06 * weight) < 1e-8 &&
+                      abs(actual.y - base.y + 0.04 * weight) < 1e-8 && actual.scale == base.scale &&
+                      abs(cut.x - actual.x) < 1e-8 && abs(cut.y - actual.y) < 1e-8,
+                      "局部修正没有保留原始运动，或影响区间外/保存/剪切后的画面")
+        }
+        for t in [time - 1, time + 1] {
+            let epsilon = 1e-5
+            let a = decoded.pose(at: t - epsilon), b = decoded.pose(at: t + epsilon)
+            let x = original.pose(at: t - epsilon), y = original.pose(at: t + epsilon)
+            try check(abs((b.x - a.x) - (y.x - x.x)) / (2 * epsilon) < 0.0001,
+                      "局部修正接回原轨迹时速度发生突变")
+        }
+        for _ in 0..<100 {
+            edited.setLocalFramingCenter(x: 0.57, y: 0.46, at: time, visibleStart: 0, visibleEnd: 8)
+        }
+        try check(edited.localCenterEdits?.count == 1 && abs(edited.pose(at: time).x - 0.57) < 1e-8,
+                  "重复鼠标事件累积了位移或多余记录")
+        edited.setLocalFramingCenter(x: 1, y: 0, at: 4.4, visibleStart: 0, visibleEnd: 8)
+        edited.setLocalFramingCenter(x: 0.48, y: 0.51, at: time, visibleStart: 0, visibleEnd: 8)
+        try check(abs(edited.pose(at: time).x - 0.48) < 1e-8 && abs(edited.pose(at: time).y - 0.51) < 1e-8,
+                  "重叠修正触及边缘后无法重新精确定位")
+        var bounded = original
+        bounded.cameraKeyframes = [CameraKeyframe(time: 0, scale: 1), CameraKeyframe(time: 1, scale: 1.8),
+            CameraKeyframe(time: 3, scale: 1), CameraKeyframe(time: 4, scale: 1.8), CameraKeyframe(time: 8, scale: 1)]
+        bounded.setLocalFramingCenter(x: 0.52, y: 0.48, at: 2.5, visibleStart: 2, visibleEnd: 6)
+        try check(bounded.localCenterEdits?.first?.start == 2 && bounded.localCenterEdits?.first?.end == 3,
+                  "局部修正越过剪切边界或中间全景节点")
+        print("PASS local framing: exact center, smooth one-second falloff, unchanged outside/scale/original, repeat and overlapping drags, edge clamps, full-view/cut boundaries, JSON and shifted cuts")
     }
 
     private static func checkPositionOnlyCameraInterpolation() throws {
@@ -1356,6 +1407,9 @@ enum ProjectSelfTest {
         try check(model.player.currentItem === framingPlayerItem,
                   "仅拖动取景框不应替换原片播放器内容")
         let edited = model.clips
+        try check(model.selectedZoom?.localCenterEdits?.count == 1 &&
+                  model.selectedZoom?.cameraKeyframes == originalClips.first?.zooms.first?.cameraKeyframes,
+                  "一次拖框生成多个修正记录，或改变了倍率锚点")
         try check(edited != originalClips && model.selectedZoom?.manualFocus == false &&
                   path.allSatisfy { model.selectedZoom?.centerPath.contains($0) == true },
                   "拖动当前框替换了已有自动路径")
@@ -1363,6 +1417,38 @@ enum ProjectSelfTest {
         let reopened = EditorModel()
         try await reopened.loadProject(folder: folder)
         try check(reopened.clips == edited, "重开未恢复取景路径")
+        let localDocument = try ProjectStore.load(folder: folder)
+        let originalTimeline = try await ProjectExporter.buildTimeline(project: project)
+        let localTimeline = try await ProjectExporter.buildTimeline(project: localDocument)
+        let oldFrames = AVAssetImageGenerator(asset: originalTimeline.asset)
+        oldFrames.videoComposition = originalTimeline.videoComposition
+        let newFrames = AVAssetImageGenerator(asset: localTimeline.asset)
+        newFrames.videoComposition = localTimeline.videoComposition
+        let localOutput = directory.appendingPathComponent("局部取景修正导出.mov")
+        try await model.export(to: localOutput)
+        let outputFrames = AVAssetImageGenerator(asset: AVURLAsset(url: localOutput))
+        func meanRed(_ image: CGImage) throws -> Double {
+            var pixels = [UInt8](repeating: 0, count: 32 * 18 * 4)
+            try pixels.withUnsafeMutableBytes { buffer in
+                guard let context = CGContext(data: buffer.baseAddress, width: 32, height: 18,
+                    bitsPerComponent: 8, bytesPerRow: 32 * 4, space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else {
+                    throw RecorderError.message("不能读取局部取景导出像素")
+                }
+                context.draw(image, in: CGRect(x: 0, y: 0, width: 32, height: 18))
+            }
+            return stride(from: 0, to: pixels.count, by: 4).reduce(0.0) { $0 + Double(pixels[$1]) } / (32 * 18)
+        }
+        for time in [0.5, 2.25, 4.75] {
+            let stamp = CMTime(seconds: time, preferredTimescale: 600)
+            let before = try meanRed(try await oldFrames.image(at: stamp).image)
+            let expected = try meanRed(try await newFrames.image(at: stamp).image)
+            let actual = try meanRed(try await outputFrames.image(at: stamp).image)
+            try check(abs(actual - expected) < 5, "实际导出未应用与预览一致的局部取景修正")
+            try check(time == 2.25 ? abs(expected - before) > 3 : abs(expected - before) < 0.1,
+                      "局部取景未改变目标时刻，或误改了影响区间外的实际视频帧")
+        }
+        print("PASS local framing video: persisted/reopened single correction, actual exported pixels match preview and outside-window frames stay unchanged")
         model.seek(3.25)
         try await Task.sleep(nanoseconds: 40_000_000)
         model.undo()
