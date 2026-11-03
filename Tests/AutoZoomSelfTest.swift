@@ -83,9 +83,56 @@ enum AutoZoomSelfTest {
             let name: String
             let trace: CursorTrace
             let duration: Double
-            let common: Bool
             let local: Bool
             let needsPan: Bool
+        }
+        // Independent frozen scalar baseline from the working 3d33f33 version.
+        // Do not call the current ZoomSegment.scale or a new planner here: both
+        // sides must not silently agree if production zoom interpolation changes.
+        struct BaselineEnvelope {
+            var start: Double
+            var rise: Double
+            var fall: Double
+            var end: Double
+            let peak: Double
+
+            func scale(at time: Double) -> Double {
+                guard time > start, time < end else { return 1 }
+                func smooth(_ value: Double) -> Double { value * value * (3 - 2 * value) }
+                if time < rise { return 1 + (peak - 1) * smooth((time - start) / (rise - start)) }
+                if time <= fall { return peak }
+                return peak + (1 - peak) * smooth((time - fall) / (end - fall))
+            }
+        }
+        func baselineEnvelopes(trace: CursorTrace, duration: Double, fps: Int) -> [BaselineEnvelope] {
+            guard trace.hasClicks else { return [] }
+            let plan = AutoZoomPlan(trace: trace, duration: duration, fps: min(30, fps))
+            let step = 1 / Double(plan.fps)
+            let count = min(plan.poses.count, Int(floor(duration * Double(plan.fps))) + 1)
+            var groups: [(Int, Int)] = [], beginning: Int?
+            for index in 0..<count {
+                if plan.poses[index].scale > 1.005 {
+                    if beginning == nil { beginning = index }
+                } else if let first = beginning { groups.append((first, index - 1)); beginning = nil }
+            }
+            if let first = beginning { groups.append((first, count - 1)) }
+            return groups.compactMap { first, last in
+                let peak = plan.poses[first...last].map(\.scale).max() ?? 1
+                guard peak > 1.02 else { return nil }
+                let high = (first...last).filter { plan.poses[$0].scale >= 1 + (peak - 1) * 0.97 }
+                let rise = high.first ?? first, fall = high.last ?? last
+                let extends = last == count - 1 && plan.poses[last].scale > 1.02
+                var value = BaselineEnvelope(start: max(0, Double(first - 1) * step), rise: Double(rise) * step,
+                    fall: extends ? max(Double(fall) * step, duration) : Double(fall) * step,
+                    end: extends ? duration + 0.5 : min(duration, Double(last + 1) * step), peak: peak)
+                let ramp = 0.05, hold = 0.001, tolerance = 0.000000001
+                if value.end - value.start < ramp + hold + ramp - tolerance { value.end = value.start + ramp + hold + ramp }
+                if value.rise - value.start < ramp - tolerance { value.rise = value.start + ramp }
+                if value.end - value.rise < ramp + hold - tolerance { value.rise = value.end - ramp - hold }
+                if value.fall - value.rise < hold - tolerance { value.fall = value.rise + hold }
+                if value.end - value.fall < ramp - tolerance { value.fall = value.end - ramp }
+                return value
+            }
         }
         func sampled(_ position: (Double) -> (Double, Double)) -> CursorTrace {
             CursorTrace(samples: (0...240).map { index in
@@ -151,32 +198,55 @@ enum AutoZoomSelfTest {
             return CursorSample(time: time, x: 0.5 + 0.42 * sin(time * .pi / 15),
                 y: 0.5 + 0.2 * cos(time * .pi / 21), inside: true, clicked: index == 15)
         })
+        let wideActivity = CursorTrace(samples: (0...720).map { index in
+            let time = Double(index) / 60
+            let phase = time.truncatingRemainder(dividingBy: 6)
+            let x = phase <= 3 ? phase / 3 : (6 - phase) / 3
+            let clicks: Set<Int> = [48, 123, 317, 369, 399, 502, 510, 608, 651, 706]
+            return CursorSample(time: time, x: x, y: 0.3 + 0.18 * sin(time * 0.8),
+                inside: true, clicked: clicks.contains(index))
+        })
         var scenarios = [
-            Scenario(name: "local-circle", trace: circle, duration: 6, common: true, local: true, needsPan: false),
-            Scenario(name: "local-irregular", trace: irregular, duration: 6, common: true, local: true, needsPan: false),
-            Scenario(name: "stationary-jitter", trace: jitter, duration: 6, common: true, local: true, needsPan: false),
-            Scenario(name: "cross-region", trace: crossing, duration: 6, common: true, local: false, needsPan: true),
-            Scenario(name: "moderate-zigzag", trace: zigzag, duration: 6, common: true, local: false, needsPan: true),
-            Scenario(name: "wide-circle", trace: wideCircle, duration: 6, common: false, local: false, needsPan: false),
-            Scenario(name: "rapid-corners", trace: jumps, duration: 5, common: false, local: false, needsPan: false),
-            Scenario(name: "subframe-jumps", trace: subframe, duration: 3, common: false, local: false, needsPan: false),
-            Scenario(name: "exit-across-screen", trace: exiting, duration: 4.5, common: false, local: false, needsPan: false),
-            Scenario(name: "outside-cross-reentry", trace: outsideCrossing, duration: 3.5, common: false, local: false, needsPan: false),
-            Scenario(name: "long-cross-region", trace: longCrossing, duration: 120, common: false, local: false, needsPan: false)
+            Scenario(name: "local-circle", trace: circle, duration: 6, local: true, needsPan: false),
+            Scenario(name: "local-irregular", trace: irregular, duration: 6, local: true, needsPan: false),
+            Scenario(name: "stationary-jitter", trace: jitter, duration: 6, local: true, needsPan: false),
+            Scenario(name: "cross-region", trace: crossing, duration: 6, local: false, needsPan: true),
+            Scenario(name: "moderate-zigzag", trace: zigzag, duration: 6, local: false, needsPan: true),
+            Scenario(name: "wide-circle", trace: wideCircle, duration: 6, local: false, needsPan: false),
+            Scenario(name: "rapid-corners", trace: jumps, duration: 5, local: false, needsPan: false),
+            Scenario(name: "subframe-jumps", trace: subframe, duration: 3, local: false, needsPan: false),
+            Scenario(name: "exit-across-screen", trace: exiting, duration: 4.5, local: false, needsPan: false),
+            Scenario(name: "outside-cross-reentry", trace: outsideCrossing, duration: 3.5, local: false, needsPan: false),
+            Scenario(name: "wide-activity-with-clicks", trace: wideActivity, duration: 12.2, local: false, needsPan: true),
+            Scenario(name: "long-cross-region", trace: longCrossing, duration: 120, local: false, needsPan: false)
         ]
         for (index, corner) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)].enumerated() {
             scenarios.append(Scenario(name: "stationary-corner-\(index)", trace: CursorTrace(samples: [
                 CursorSample(time: 0, x: corner.0, y: corner.1, inside: true, clicked: false),
                 CursorSample(time: 0.2, x: corner.0, y: corner.1, inside: true, clicked: true)
-            ]), duration: 3.5, common: true, local: false, needsPan: false))
+            ]), duration: 3.5, local: false, needsPan: false))
+        }
+        if let argument = CommandLine.arguments.firstIndex(of: "--trace-project-regression") {
+            guard CommandLine.arguments.indices.contains(argument + 1) else {
+                throw RecorderError.message("真实轨迹回归缺少临时工程参数文件")
+            }
+            let url = URL(fileURLWithPath: CommandLine.arguments[argument + 1])
+            let project = try JSONDecoder().decode(RecordingProject.self, from: Data(contentsOf: url))
+            scenarios.append(Scenario(name: "private-recording-replay", trace: project.trace,
+                duration: project.sourceDuration, local: false, needsPan: false))
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         for fps in [30, 60] {
+            try check(ProjectStore.automaticZooms(trace: CursorTrace(samples: [
+                CursorSample(time: 0, x: 0.3, y: 0.4, inside: true, clicked: false),
+                CursorSample(time: 2, x: 0.9, y: 0.4, inside: true, clicked: false)
+            ]), duration: 4, fps: Int32(fps)).isEmpty, "\(fps)fps：没有点击时不应由位置简化凭空产生放大")
             for scenario in scenarios {
                 let label = "\(scenario.name) \(fps)fps"
                 let originalTrace = try encoder.encode(scenario.trace)
                 let planningBegan = Date()
+                let baseline = baselineEnvelopes(trace: scenario.trace, duration: scenario.duration, fps: fps)
                 let zooms = ProjectStore.automaticZooms(trace: scenario.trace,
                     duration: scenario.duration, fps: Int32(fps))
                 let planningDuration = Date().timeIntervalSince(planningBegan)
@@ -184,28 +254,48 @@ enum AutoZoomSelfTest {
                 let restored = try JSONDecoder().decode([ZoomSegment].self, from: encoder.encode(zooms))
                 let reopened = DemoClip(title: label, sourceStart: 0, duration: scenario.duration, zooms: restored)
                 let largestCount = zooms.map { $0.cameraControlPoints.count }.max() ?? 0
-                if scenario.common {
-                    try check(!zooms.isEmpty && zooms.allSatisfy { (4...8).contains($0.cameraControlPoints.count) },
-                              "\(label)：普通自动镜头应保留四基础点并控制在八点以内")
-                    try check((zooms.map(\.peak).max() ?? 1) > 1.5,
-                              "\(label)：普通操作不应靠退回全景来逃避取景规划")
+                try check(!baseline.isEmpty && zooms.count == baseline.count &&
+                          zooms.allSatisfy { $0.cameraControlPoints.count >= 4 },
+                          "\(label)：简化位置时删除了原有放大段或四个基础阶段点")
+                for (zoom, original) in zip(zooms, baseline) {
+                    try check(abs(zoom.start - original.start) < 0.000000001 &&
+                              abs(zoom.riseEnd - original.rise) < 0.000000001 &&
+                              abs(zoom.fallStart - original.fall) < 0.000000001 &&
+                              abs(zoom.end - original.end) < 0.000000001 && abs(zoom.peak - original.peak) < 0.000000001,
+                              "\(label)：位置简化改变了旧版四阶段时刻或放大峰值")
+                    for time in [original.start, original.rise, original.fall, original.end] {
+                        try check(zoom.cameraControlPoints.contains { abs($0.time - time) < 0.000000001 },
+                                  "\(label)：编辑器缺少初始四个基础阶段控制点")
+                    }
+                    for index in 0...120 {
+                        let time = original.start + (original.end - original.start) * Double(index) / 120
+                        try check(abs(zoom.scale(at: time) - original.scale(at: time)) <= 0.000000001,
+                                  "\(label)：完整放大段（包括片尾外缓出）的倍率偏离旧版")
+                    }
                 }
                 if scenario.local {
                     try check(largestCount <= 6, "\(label)：一个取景框容得下的局部活动仍生成了太多编辑点")
                 }
                 if scenario.name == "moderate-zigzag" {
-                    try check(zooms.contains { (5...8).contains($0.cameraControlPoints.count) && $0.peak > 1.5 },
-                              "\(label)：正常跨区反向应补少量关键点并保留放大，不能一律只留四点再降低倍率")
+                    try check(zooms.contains { $0.cameraControlPoints.count >= 5 && $0.peak > 1.5 },
+                              "\(label)：正常跨区反向应保留必要转向节点与放大，不能用降低倍率换取少点")
                 }
                 if scenario.name == "long-cross-region" {
-                    try check(planningDuration <= 10 && largestCount <= 8,
-                              "\(label)：120秒轨迹规划超过十秒或仍产生八个以上的编辑点")
+                    try check(planningDuration <= 10,
+                              "\(label)：120秒轨迹规划超过十秒")
                 }
                 var largestViolation = 0.0
+                var largestScaleError = 0.0
+                var zoomedSamples = 0, inspectedSamples = 0
                 var totalTravel = 0.0, plateauTravel = 0.0
                 var smallestCenterX = 1.0, largestCenterX = 0.0
                 func inspect(_ time: Double, x: Double? = nil, y: Double? = nil) throws {
                     let pose = clip.pose(at: time), savedPose = reopened.pose(at: time)
+                    let expectedScale = baseline.map { $0.scale(at: time) }.max() ?? 1
+                    let scaleError = abs(pose.scale - expectedScale)
+                    largestScaleError = max(largestScaleError, scaleError)
+                    try check(scaleError <= 0.000000001,
+                              "\(label)：\(time)s的倍率由旧版\(expectedScale)变为\(pose.scale)，位置简化不能修改缩放曲线")
                     try check([pose.x, pose.y, pose.scale].allSatisfy(\.isFinite) && pose.scale >= 1 && pose.scale <= 1.600000001,
                               "\(label)：最终镜头倍率或取景位置无效")
                     let half = 0.5 / pose.scale
@@ -247,6 +337,8 @@ enum AutoZoomSelfTest {
                 let frameCount = Int(ceil(scenario.duration * 240))
                 for index in 0...frameCount {
                     let time = min(scenario.duration, Double(index) / 240), pose = clip.pose(at: time)
+                    inspectedSamples += 1
+                    if pose.scale > 1.5 { zoomedSamples += 1 }
                     try inspect(time)
                     if let last = samples.last, last.inside, time >= last.time {
                         try inspect(time, x: last.x, y: last.y)
@@ -269,6 +361,8 @@ enum AutoZoomSelfTest {
                 }
                 for zoom in zooms {
                     let controls = zoom.cameraControlPoints
+                    try check(zoom.positionMotion == true && zoom.simpleMotion != true,
+                              "\(label)：新位置路线仍在使用会改写倍率的简化模式")
                     try check(controls.first?.scale == 1 && controls.last?.scale == 1 &&
                               zip(controls, controls.dropFirst()).allSatisfy { $0.time < $1.time },
                               "\(label)：基础端点或关键点时间顺序不正确")
@@ -297,11 +391,12 @@ enum AutoZoomSelfTest {
                 }
                 try check(try encoder.encode(scenario.trace) == originalTrace && restored == zooms,
                           "\(label)：简化或保存重开改变了原始鼠标记录或关键点数据")
-                print(String(format: "METRIC simplified %@: maxNodes=%d, travel=%.5f, plateauTravel=%.5f, cursorViolation=%.9f, planningSeconds=%.4f",
-                             label, largestCount, totalTravel, plateauTravel, largestViolation, planningDuration))
+                print(String(format: "METRIC simplified %@: zooms=%d, peak=%.6f, maxNodes=%d, travel=%.5f, plateauTravel=%.5f, cursorViolation=%.9f, scaleError=%.12f, zoomedFraction=%.4f, planningSeconds=%.4f",
+                             label, zooms.count, zooms.map(\.peak).max() ?? 1, largestCount, totalTravel, plateauTravel,
+                             largestViolation, largestScaleError, Double(zoomedSamples) / Double(max(1, inspectedSamples)), planningDuration))
             }
         }
-        print("PASS simplified motion: sparse straight paths, local stability, real pans, corner/subframe/source-boundary containment, inverse-zoom edges, 120-second planning, 30/60fps and JSON identity")
+        print("PASS simplified motion: frozen working-version zoom timing/scales, no dropped zooms, constrained straight position paths, local stability, wide-screen operations, corner/subframe/source-boundary containment, 120-second planning, 30/60fps and JSON identity")
     }
 
     private static func checkSafeZone(fps: Int) throws {

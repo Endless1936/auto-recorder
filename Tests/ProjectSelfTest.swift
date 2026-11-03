@@ -136,6 +136,7 @@ enum ProjectSelfTest {
 
     static func runLogic() throws {
         try checkSimpleCameraInterpolation()
+        try checkPositionOnlyCameraInterpolation()
         try checkCameraKeyframes()
         try checkAutomaticMotionLogic()
         try checkDeletedMotionSpans()
@@ -243,6 +244,43 @@ enum ProjectSelfTest {
                   repairedZoom.riseEnd < repairedZoom.fallStart && repairedZoom.fallStart < repairedZoom.end,
                   "重开时没有修复退化时序，或错误重新生成了用户镜头")
         print("PASS saved control repair: degenerate timing repaired without replacing camera identity, amplitude or pointer trace")
+    }
+
+    private static func checkPositionOnlyCameraInterpolation() throws {
+        let original = ZoomSegment(start: 1, riseEnd: 3, fallStart: 7, end: 9, peak: 1.6)
+        let times = [1.0, 1.6, 3, 5, 7, 8.2, 9]
+        let centers = times.map { time -> ZoomCenterPoint in
+            let half = 0.5 / original.scale(at: time)
+            return ZoomCenterPoint(time: time, x: half, y: 1 - half,
+                timing: time < 3 || time >= 7 ? .viewport : .smooth)
+        }
+        let zoom = ZoomSegment(start: 1, riseEnd: 3, fallStart: 7, end: 9, peak: 1.6,
+            centerPath: centers, manualFocus: true, manualCenterPath: centers, positionMotion: true).normalized()
+        try check(zoom.cameraKeyframes == nil && zoom.cameraControlPoints.count == times.count,
+                  "位置简化没有暴露全部实际节点，或提前替换了原倍率曲线")
+        var inserted = zoom
+        for time in [1.9, 4.1, 8.6] { _ = inserted.addCameraKeyframe(at: time) }
+        inserted = inserted.normalized()
+        let decoded = try JSONDecoder().decode(ZoomSegment.self, from: JSONEncoder().encode(inserted))
+        let shifted = decoded.shifted(by: -1.4).normalized()
+        try check(decoded == inserted && decoded.manualCenterPath == centers &&
+                  shifted.manualCenterPath?.map(\.timing) == centers.map(\.timing),
+                  "保存、加点或剪切丢失了位置节点的插值方式")
+        for index in 0...1920 {
+            let time = 1 + Double(index) / 240, expected = original.scale(at: time)
+            for (value, offset) in [(zoom, 0.0), (decoded, 0.0), (shifted, -1.4)] {
+                let pose = value.pose(at: time + offset), half = 0.5 / pose.scale
+                try check(abs(pose.scale - expected) < 0.00000001 &&
+                          abs(pose.x - half) < 0.00000001 && abs(pose.y - (1 - half)) < 0.00000001,
+                          "位置插值、无修改加点或剪切改变了原有倍率，或在边角产生裁切")
+            }
+        }
+        let moving = decoded.cameraControlPoints.first { abs($0.time - 5) < 0.000001 }!
+        var moved = decoded
+        moved.moveCameraKeyframes(ids: [moving.id], timeDelta: 0.2, scaleDelta: 0)
+        try check(moved.manualCenterPath?.contains(where: { abs($0.time - 5.2) < 0.000001 && $0.timing == .smooth }) == true,
+                  "移动锚点时间丢失了位置插值方式")
+        print("PASS position-only camera: unchanged historical scale, visible route, viewport timing, exact insertion, JSON, cuts and horizontal movement")
     }
 
     private static func checkSimpleCameraInterpolation() throws {

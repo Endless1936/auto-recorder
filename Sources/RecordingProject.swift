@@ -12,6 +12,7 @@ struct ZoomCenterPoint: Codable, Equatable, Sendable {
     var time: Double
     var x: Double
     var y: Double
+    var timing: CameraPositionTiming? = nil
 }
 
 struct CameraKeyframe: Identifiable, Codable, Equatable, Sendable {
@@ -65,6 +66,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     // New automatic paths ease viewport size and center together. Older authored
     // documents retain their original magnification interpolation.
     var simpleMotion: Bool?
+    var positionMotion: Bool?
 
     init(id: UUID = UUID(), start: Double = 1, riseEnd: Double = 2,
          fallStart: Double = 8, end: Double = 9, peak: Double = 1.6,
@@ -73,7 +75,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
          manualCenterPath: [ZoomCenterPoint]? = nil,
          cameraKeyframes: [CameraKeyframe]? = nil,
          centerOffsets: [CameraCenterOffset]? = nil,
-         centerPanSpans: [CameraPanSpan]? = nil, simpleMotion: Bool? = nil) {
+         centerPanSpans: [CameraPanSpan]? = nil, simpleMotion: Bool? = nil, positionMotion: Bool? = nil) {
         self.id = id; self.start = start; self.riseEnd = riseEnd
         self.fallStart = fallStart; self.end = end; self.peak = peak
         self.focusX = focusX; self.focusY = focusY
@@ -83,6 +85,7 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         self.centerOffsets = centerOffsets
         self.centerPanSpans = centerPanSpans
         self.simpleMotion = simpleMotion
+        self.positionMotion = positionMotion
     }
 
     static func standard(duration: Double, peak: Double = 1.6) -> ZoomSegment {
@@ -98,7 +101,10 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         if let points = cameraKeyframes, points.count >= 2 { return points }
         let originalTimes = [start, riseEnd, fallStart, end]
         var times = originalTimes
-        if !manualFocus, centerPath.count > 2, start < riseEnd, riseEnd < fallStart, fallStart < end {
+        if positionMotion == true {
+            times = sortedMotionTimes(originalTimes + (manualCenterPath ?? []).map(\.time))
+                .filter { $0 >= start && $0 <= end }
+        } else if !manualFocus, centerPath.count > 2, start < riseEnd, riseEnd < fallStart, fallStart < end {
             let pathTimes = centerPath.map(\.time).filter { time in
                 !originalTimes.contains(where: { abs($0 - time) < 0.000001 })
             }
@@ -113,7 +119,8 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         }
         return times.map { time in
             let originalIndex = originalTimes.firstIndex(where: { abs($0 - time) < 0.000001 })
-            let sourceIndex = centerPath.firstIndex(where: { abs($0.time - time) < 0.000001 }) ?? 0
+            let source = positionMotion == true ? (manualCenterPath ?? []) : centerPath
+            let sourceIndex = source.firstIndex(where: { abs($0.time - time) < 0.000001 }) ?? 0
             let index = originalIndex ?? (sourceIndex + 4)
             var bytes = id.uuid
             let code = UInt64(index + 1)
@@ -245,7 +252,8 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
                 for point in moving {
                     let center = original.pose(at: point.time)
                     let stored = original.manualCenterPath?.first { abs($0.time - point.time) < 0.000001 }
-                    path.append(ZoomCenterPoint(time: point.time + timeDelta, x: stored?.x ?? center.x, y: stored?.y ?? center.y))
+                    path.append(ZoomCenterPoint(time: point.time + timeDelta, x: stored?.x ?? center.x,
+                                                y: stored?.y ?? center.y, timing: stored?.timing))
                 }
                 manualCenterPath = path.sorted { $0.time < $1.time }
             }
@@ -274,7 +282,8 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         }
         var path = manualCenterPath ?? []
         let original = path.first(where: { abs($0.time - oldTime) < 0.000001 })
-        let moved = ZoomCenterPoint(time: newTime, x: original?.x ?? value.x, y: original?.y ?? value.y)
+        let moved = ZoomCenterPoint(time: newTime, x: original?.x ?? value.x,
+                                    y: original?.y ?? value.y, timing: original?.timing)
         path.removeAll { abs($0.time - oldTime) < 0.000001 || abs($0.time - newTime) < 0.000001 }
         path.append(moved)
         path.sort { $0.time < $1.time }
@@ -395,8 +404,8 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         var result = self
         result.start += offset; result.riseEnd += offset
         result.fallStart += offset; result.end += offset
-        result.centerPath = centerPath.map { ZoomCenterPoint(time: $0.time + offset, x: $0.x, y: $0.y) }
-        result.manualCenterPath = manualCenterPath?.map { ZoomCenterPoint(time: $0.time + offset, x: $0.x, y: $0.y) }
+        result.centerPath = centerPath.map { ZoomCenterPoint(time: $0.time + offset, x: $0.x, y: $0.y, timing: $0.timing) }
+        result.manualCenterPath = manualCenterPath?.map { ZoomCenterPoint(time: $0.time + offset, x: $0.x, y: $0.y, timing: $0.timing) }
         result.cameraKeyframes = cameraKeyframes?.map { var point = $0; point.time += offset; return point }
         result.centerOffsets = centerOffsets?.map { var point = $0; point.time += offset; return point }
         result.centerPanSpans = centerPanSpans?.map { var span = $0; span.start += offset; span.end += offset; return span }
@@ -513,12 +522,13 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         if cameraKeyframes != nil { _ = addCameraKeyframe(at: time) }
         splitCenterPans(at: time)
         let margin = 0.5 / scale(at: time)
-        let point = ZoomCenterPoint(time: time, x: min(1 - margin, max(margin, x)),
-                                    y: min(1 - margin, max(margin, y)))
         var path = manualCenterPath ?? [ZoomCenterPoint(time: start, x: 0.5, y: 0.5),
             ZoomCenterPoint(time: riseEnd, x: focusX, y: focusY),
             ZoomCenterPoint(time: fallStart, x: focusX, y: focusY),
             ZoomCenterPoint(time: end, x: 0.5, y: 0.5)]
+        let prior = path.first { abs($0.time - time) < 0.000001 }
+        let point = ZoomCenterPoint(time: time, x: min(1 - margin, max(margin, x)),
+                                    y: min(1 - margin, max(margin, y)), timing: prior?.timing)
         if let index = path.firstIndex(where: { abs($0.time - time) < 0.000001 }) {
             path[index].x = point.x
             path[index].y = point.y
@@ -571,7 +581,18 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         }
         let a = path[lower], b = path[upper]
         let rawFraction = (time - a.time) / max(0.000001, b.time - a.time)
-        let fraction = eased ? Self.smoothstep(rawFraction) : rawFraction
+        let fraction: Double
+        if eased {
+            switch a.timing ?? .smooth {
+            case .linear: fraction = rawFraction
+            case .smooth: fraction = Self.smoothstep(rawFraction)
+            case .viewport:
+                let firstRadius = 0.5 / scale(at: a.time), lastRadius = 0.5 / scale(at: b.time)
+                if abs(lastRadius - firstRadius) > 0.000000000001 {
+                    fraction = min(1, max(0, (0.5 / scale(at: time) - firstRadius) / (lastRadius - firstRadius)))
+                } else { fraction = Self.smoothstep(rawFraction) }
+            }
+        } else { fraction = rawFraction }
         return (a.x + (b.x - a.x) * fraction, a.y + (b.y - a.y) * fraction)
     }
 
@@ -596,10 +617,10 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
         result.focusY = result.focusY.isFinite ? min(1, max(0, result.focusY)) : 0.5
         result.centerPath = result.centerPath.filter { $0.time.isFinite && $0.x.isFinite && $0.y.isFinite }
             .sorted { $0.time < $1.time }
-            .map { ZoomCenterPoint(time: $0.time, x: min(1, max(0, $0.x)), y: min(1, max(0, $0.y))) }
+            .map { ZoomCenterPoint(time: $0.time, x: min(1, max(0, $0.x)), y: min(1, max(0, $0.y)), timing: $0.timing) }
         result.manualCenterPath = result.manualCenterPath?.filter { $0.time.isFinite && $0.x.isFinite && $0.y.isFinite }
             .sorted { $0.time < $1.time }
-            .map { ZoomCenterPoint(time: $0.time, x: min(1, max(0, $0.x)), y: min(1, max(0, $0.y))) }
+            .map { ZoomCenterPoint(time: $0.time, x: min(1, max(0, $0.x)), y: min(1, max(0, $0.y)), timing: $0.timing) }
         if let raw = result.cameraKeyframes {
             var seenIDs = Set<UUID>()
             var points: [CameraKeyframe] = []
@@ -610,12 +631,18 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
                 points.append(point)
             }
             if points.count >= 2 {
+                let originalRise = result.riseEnd, originalFall = result.fallStart
                 points[0].scale = 1; points[points.count - 1].scale = 1
                 result.cameraKeyframes = points
                 result.start = points[0].time; result.end = points[points.count - 1].time
                 result.peak = points.map(\.scale).max() ?? 1
                 result.riseEnd = result.start + (result.end - result.start) / 3
                 result.fallStart = result.start + (result.end - result.start) * 2 / 3
+                if result.positionMotion == true, originalRise > result.start,
+                   originalFall > originalRise, originalFall < result.end {
+                    result.riseEnd = originalRise
+                    result.fallStart = originalFall
+                }
                 if result.simpleMotion == true {
                     let middle = Array(points.dropFirst().dropLast())
                     let high = middle.filter { abs($0.scale - result.peak) < 0.000000001 }
@@ -912,19 +939,21 @@ enum ProjectStore {
         }
     }
 
-    static func simplifiedMotion(_ original: ZoomSegment, trace: CursorTrace, fps: Int) -> ZoomSegment? {
+    static func simplifiedMotion(_ original: ZoomSegment, trace: CursorTrace, fps: Int) -> ZoomSegment {
         let times = [original.start, original.riseEnd, original.fallStart, original.end]
-        let mandatory = times.map { time -> SimplifiedCameraWaypoint in
+        let referenceTimes = Array(Set(original.centerPath.map(\.time) + times)).sorted()
+        let reference = referenceTimes.map { time -> CameraPositionWaypoint in
             let pose = original.pose(at: time)
-            return SimplifiedCameraWaypoint(time: time, x: pose.x, y: pose.y, scale: original.scale(at: time))
+            return CameraPositionWaypoint(time: time, x: pose.x, y: pose.y)
         }
-        let points = SimplifiedCameraPath.plan(trace: trace, mandatory: mandatory, fps: fps)
-        guard points.count >= 4, points.contains(where: { $0.scale > 1.000001 }) else { return nil }
+        let points = SimplifiedCameraPath.plan(trace: trace, reference: reference,
+            mandatoryTimes: times, scaleAt: { original.scale(at: $0) }, fps: fps)
         var result = original
-        result.simpleMotion = true
+        result.simpleMotion = nil
+        result.positionMotion = true
         result.manualFocus = true
-        result.manualCenterPath = points.map { ZoomCenterPoint(time: $0.time, x: $0.x, y: $0.y) }
-        result.cameraKeyframes = points.map { CameraKeyframe(time: $0.time, scale: $0.scale) }
+        result.manualCenterPath = points.map { ZoomCenterPoint(time: $0.time, x: $0.x, y: $0.y, timing: $0.timing) }
+        result.cameraKeyframes = nil
         result.centerOffsets = nil
         result.centerPanSpans = nil
         return result.normalized()

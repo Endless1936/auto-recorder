@@ -964,17 +964,17 @@ enum EditorUISelfTest {
             let duration = original[targetIndex].duration, clipID = original[targetIndex].id
             let offset = model.startTime(of: clipID)
             let points = [CameraKeyframe(time: duration * 0.05, scale: 1),
-                CameraKeyframe(time: duration * 0.25, scale: 1.8),
+                CameraKeyframe(time: duration * 0.25, scale: 1.6),
                 CameraKeyframe(time: duration * 0.72, scale: 1.6),
                 CameraKeyframe(time: duration * 0.95, scale: 1)]
-            let centers = [ZoomCenterPoint(time: points[0].time, x: 0.5, y: 0.5),
+            let centers = [ZoomCenterPoint(time: points[0].time, x: 0.5, y: 0.5, timing: .viewport),
                 ZoomCenterPoint(time: points[1].time, x: 0.42, y: 0.45),
-                ZoomCenterPoint(time: points[2].time, x: 0.6, y: 0.55),
+                ZoomCenterPoint(time: points[2].time, x: 0.6, y: 0.55, timing: .viewport),
                 ZoomCenterPoint(time: points[3].time, x: 0.5, y: 0.5)]
             let zoom = ZoomSegment(start: points[0].time, riseEnd: points[1].time,
-                fallStart: points[2].time, end: points[3].time, peak: 1.8,
+                fallStart: points[2].time, end: points[3].time, peak: 1.6,
                 centerPath: centers, manualFocus: true, manualCenterPath: centers,
-                cameraKeyframes: points, simpleMotion: true).normalized()
+                positionMotion: true).normalized()
             var fixture = original
             fixture[targetIndex].zooms = [zoom]
             model.clips = fixture
@@ -994,8 +994,9 @@ enum EditorUISelfTest {
                 throw failure("Native Add Anchor did not create a point on the simplified camera path.")
             }
             let addedClips = model.clips
-            try require(addedZoom.simpleMotion == true && addedZoom.cameraControlPoints.count == 5,
-                        "Adding a simplified-camera anchor lost its inverse-scale interpolation mode.")
+            try require(addedZoom.positionMotion == true && addedZoom.simpleMotion != true &&
+                        addedZoom.cameraControlPoints.count == 5,
+                        "Adding a simplified-camera anchor lost its independent position interpolation mode.")
             for index in 0...160 {
                 let time = duration * Double(index) / 160
                 let before = zoom.pose(at: time), after = addedZoom.pose(at: time)
@@ -1013,8 +1014,8 @@ enum EditorUISelfTest {
             }
             let saved = try persistedClips()
             try require(abs(moved.time - targetTime) < 0.000001 && moved.scale > 2.1 &&
-                        movedZoom.simpleMotion == true && movedZoom.centerPath == zoom.centerPath &&
-                        saved == model.clips && saved[targetIndex].zooms.first(where: { $0.id == zoom.id })?.simpleMotion == true &&
+                        movedZoom.positionMotion == true && movedZoom.centerPath == zoom.centerPath &&
+                        saved == model.clips && saved[targetIndex].zooms.first(where: { $0.id == zoom.id })?.positionMotion == true &&
                         model.player.currentItem === rawItem,
                         "Dragging a simplified-camera node failed to save time/scale/mode, changed the retained path or replaced raw video.")
             try screenshot("simplified-camera-native-node-drag")
@@ -1037,7 +1038,7 @@ enum EditorUISelfTest {
             try await model.rebuildPreview()
             await refreshDisplayedLayout()
             record("simplified-motion-native-add-drag-save-and-undo", began,
-                   "Native insertion preserved every sampled inverse-scale pose; dragging its new node saved time, magnification and simpleMotion without replacing raw video, and one Undo restored each exact prior state.")
+                   "Native insertion preserved every sampled position and original scale; dragging its new node saved time, magnification and positionMotion without replacing raw video, and one Undo restored each exact prior state.")
         }
 
         func checkCameraCurveSelection(original: [DemoClip]) async throws {
