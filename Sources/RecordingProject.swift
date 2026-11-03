@@ -1019,7 +1019,10 @@ final class EditorModel: ObservableObject {
     @Published var selectedMotionPointTime: Double?
     @Published var playhead: Double
     @Published var isPlaying = false {
-        didSet { if isPlaying && previewReplacementGeneration == nil { player.play() } else { player.pause() } }
+        didSet {
+            if isPlaying && !oldValue { revealTimeAxisPlayhead() }
+            if isPlaying && previewReplacementGeneration == nil { player.play() } else { player.pause() }
+        }
     }
     @Published var focusEditing = false
     @Published private(set) var showsFramingOverlay = false
@@ -1048,6 +1051,7 @@ final class EditorModel: ObservableObject {
     var beforePreviewCommit: ((Bool) async -> Void)?
     private var exporter: ProjectExporter?
     private var isLoading = false
+    private var followsTimeAxisPlayback = true
 
     private struct Snapshot: Equatable {
         var clips: [DemoClip]
@@ -1069,7 +1073,10 @@ final class EditorModel: ObservableObject {
             MainActor.assumeIsolated {
                 guard let self, self.isPlaying, self.previewReplacementGeneration == nil else { return }
                 let value = time.seconds
-                if value.isFinite { self.playhead = min(self.totalDuration, max(0, value)) }
+                if value.isFinite {
+                    self.playhead = min(self.totalDuration, max(0, value))
+                    if self.followsTimeAxisPlayback { self.updateTimeAxisFocus() }
+                }
                 if self.playhead >= self.totalDuration - 0.02 { self.isPlaying = false }
             }
         }
@@ -1084,11 +1091,25 @@ final class EditorModel: ObservableObject {
     var duration: Double { totalDuration }
     func zoomTimeAxis(by factor: Double, anchor: Double) {
         guard editingSnapshot == nil, !clips.isEmpty else { return }
+        let before = timeViewport
         timeViewport.zoom(by: factor, anchor: anchor)
+        if timeViewport != before { followsTimeAxisPlayback = false }
     }
     func panTimeAxis(by fraction: Double) {
         guard editingSnapshot == nil else { return }
+        let before = timeViewport
         timeViewport.pan(by: fraction)
+        if timeViewport != before { followsTimeAxisPlayback = false }
+    }
+    func revealTimeAxisPlayhead() {
+        followsTimeAxisPlayback = true
+        updateTimeAxisFocus()
+    }
+    private func updateTimeAxisFocus() {
+        guard editingSnapshot == nil, totalDuration > 0 else { return }
+        var next = timeViewport
+        next.reveal(playhead / totalDuration)
+        if next != timeViewport { timeViewport = next }
     }
     var canUndo: Bool { !history.isEmpty || editingSnapshot != nil }
     var selectedClip: DemoClip? { clips.first { $0.id == selectedClipID } }
@@ -1611,9 +1632,10 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    func seek(_ time: Double) {
+    func seek(_ time: Double, followViewport: Bool = true) {
         guard time.isFinite else { return }
         playhead = min(totalDuration, max(0, time))
+        if followViewport { revealTimeAxisPlayhead() }
         player.seek(to: CMTime(seconds: playhead, preferredTimescale: 60_000), toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
@@ -1946,7 +1968,7 @@ final class EditorModel: ObservableObject {
         selectedMotionPointTime = snapshot.selectedMotionPointTime
         canonicalizeZooms()
         isPlaying = false
-        seek(snapshot.playhead)
+        seek(snapshot.playhead, followViewport: false)
     }
 
     func loadProject(folder: URL) async throws {
@@ -2007,6 +2029,7 @@ final class EditorModel: ObservableObject {
             previewGeneration = UUID()
             project = loaded
             timeViewport = EditorTimeViewport()
+            followsTimeAxisPlayback = true
             sourceURL = loaded.sourceURL; projectURL = loaded.folderURL
             fps = loaded.fps; quality = loaded.quality; sourcePixelSize = size
             clips = loaded.clips; selectedClipID = selection?.id; selectedZoomID = zoomID

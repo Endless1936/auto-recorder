@@ -274,6 +274,8 @@ enum EditorUISelfTest {
             let knob = scroller.convert(scroller.rect(for: .knob), to: nil)
             try require(scroller.alphaValue == 1 && scroller.isEnabled && knob.width > 10 && knob.height > 0,
                         "The shared scrollbar is hidden or has no usable knob.")
+            try require((scroller as? EditorTimeScrollerView)?.visibleKnobRect.height == 4 && scroller.bounds.height >= 12,
+                        "The scrollbar is not visually slim or lost its larger native drag target.")
             let panBeforeKnob = model.timeViewport.start
             // AppKit scrollbars track synchronously; enqueue the entire native
             // gesture before yielding so no physical mouse input is needed.
@@ -291,6 +293,61 @@ enum EditorUISelfTest {
             await settle(0.12)
             try require(model.timeViewport.start < panBeforeKnob && model.clips == fixture,
                         "Dragging the shared scrollbar did not pan both axes without editing content.")
+            let navigationJSON = try Data(contentsOf: jsonURL), navigationUndo = model.canUndo
+            model.zoomTimeAxis(by: 4 / model.timeViewport.scale, anchor: 0.5)
+            model.panTimeAxis(by: -10)
+            let beforePanTime = model.playhead
+            try await timeScroll(at: anchor, vertical: -2)
+            let ordinaryPan = model.timeViewport.start
+            try await timeScroll(at: anchor, vertical: 2)
+            try await timeScroll(at: anchor, vertical: -2, shift: true)
+            try require(model.timeViewport.start > ordinaryPan * 10 && model.playhead == beforePanTime,
+                        "Shift-wheel is still slow or changes playback time instead of the shared viewport.")
+            try await timeScroll(at: anchor, vertical: 2, shift: true)
+            model.seek(controls.last!.time)
+            model.panTimeAxis(by: -10)
+            try await arrowKey(forward: true)
+            try require(abs(model.playhead - duration) < 0.005 &&
+                        abs((model.playhead / total - model.timeViewport.start) * model.timeViewport.scale - 0.75) < 0.01,
+                        "Down-arrow did not reveal the next clip boundary with an edge margin.")
+            model.panTimeAxis(by: 10)
+            try await arrowKey(forward: false)
+            try require(abs(model.playhead - controls.last!.time) < 0.005 &&
+                        abs((model.playhead / total - model.timeViewport.start) * model.timeViewport.scale - 0.25) < 0.01,
+                        "Up-arrow did not reveal the previous anchor on both axes.")
+            let stableViewport = model.timeViewport
+            try await arrowKey(forward: true)
+            try require(model.timeViewport == stableViewport,
+                        "Navigation inside the safe visible area unnecessarily recentered the view.")
+            let scrubTime = (model.timeViewport.start + 0.99 / model.timeViewport.scale) * total
+            try await click(at: NSPoint(x: ruler.minX + ruler.width * 0.99, y: ruler.midY))
+            try require(abs(model.playhead - scrubTime) < 0.005 &&
+                        abs((model.playhead / total - model.timeViewport.start) * model.timeViewport.scale - 0.75) < 0.01,
+                        "Releasing a ruler scrub near the edge did not reveal its target.")
+            let curveTime = (model.timeViewport.start + 0.02 / model.timeViewport.scale) * total
+            let curveSeek = try cameraGraphPoint(globalTime: curveTime, scale: 2.9)
+            try await click(at: curveSeek)
+            try require(abs(model.playhead - curveTime) < 0.005 &&
+                        abs((model.playhead / total - model.timeViewport.start) * model.timeViewport.scale - 0.25) < 0.01,
+                        "Animation-axis seeking did not keep the shared target visible.")
+            try require(model.clips == fixture && model.canUndo == navigationUndo,
+                        "Fast scrolling or automatic reveal changed editing data or Undo.")
+            try require(try Data(contentsOf: jsonURL) == navigationJSON,
+                        "Fast scrolling or automatic reveal rewrote project.json.")
+            try screenshot("shared-axis-edge-follow-and-slim-scrollbar")
+            model.zoomTimeAxis(by: 16 / model.timeViewport.scale, anchor: 0.5)
+            model.seek(0.25)
+            let beforePlayback = model.timeViewport
+            model.isPlaying = true
+            await settle(0.6)
+            try require(model.playhead > 0.5 && model.timeViewport.start > beforePlayback.start,
+                        "Playback crossed the visible edge without moving both axes forward.")
+            model.panTimeAxis(by: 10)
+            let browsed = model.timeViewport, browsingTime = model.playhead
+            await settle(0.2)
+            try require(model.playhead > browsingTime && model.timeViewport == browsed,
+                        "Playback immediately undid manual timeline browsing.")
+            model.isPlaying = false
             for _ in 0..<30 { try await timeZoomKey(increase: false) }
             try require(model.timeViewport.scale == 1 && model.timeViewport.start == 0 &&
                         abs((try clipFrame(clip.id)).minX - ruler.minX) <= 1 &&
@@ -298,7 +355,7 @@ enum EditorUISelfTest {
                         "Command-minus permits less than 100% or leaves an empty edge after fitting.")
             try screenshot("shared-axis-minimum-100-percent")
             record("shared-axis-command-zoom-pan-and-edit", began,
-                   "AppKit Command-plus/minus and Command-wheel on both axes shared one anchored range; pan, ruler/curve seeks and a magnified node drag stayed aligned, Undo retained view state and zoom-out/pan limits kept media filling 100% of the visible range.")
+                   "Both axes shared anchored zoom, native scrollbar dragging and faster Shift-wheel pan; arrow navigation and ruler/curve seeks revealed targets with edge margins, dragging/Undo stayed stable and the visible scrollbar thumb was 4pt with a larger hit target.")
             model.clips = original; model.selectedClipID = previousClip; model.selectedZoomID = previousZoom
             model.seek(previousTime)
             try model.autosave()
@@ -321,12 +378,14 @@ enum EditorUISelfTest {
             await settle(0.035)
         }
 
-        func timeScroll(at point: NSPoint, vertical: Int64 = 0, horizontal: Int64 = 0, command: Bool = false) async throws {
+        func timeScroll(at point: NSPoint, vertical: Int64 = 0, horizontal: Int64 = 0, command: Bool = false, shift: Bool = false) async throws {
             try await ensureActiveAndKeyWindow()
+            var modifiers: NSEvent.ModifierFlags = command ? .command : []
+            if shift { modifiers.insert(.shift) }
             // Converting a window-bound mouse event preserves its window and
             // local coordinates in the public CGEvent -> NSEvent bridge.
             guard let mouse = NSEvent.mouseEvent(with: .mouseMoved, location: point,
-                modifierFlags: command ? .command : [], timestamp: ProcessInfo.processInfo.systemUptime,
+                modifierFlags: modifiers, timestamp: ProcessInfo.processInfo.systemUptime,
                 windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0),
                 let cg = mouse.cgEvent else { throw failure("Cannot construct window-bound wheel input.") }
             cg.type = .scrollWheel

@@ -22,6 +22,18 @@ struct EditorTimeViewport: Equatable {
         guard fraction.isFinite else { return }
         start = min(maximumStart, max(0, start + fraction))
     }
+
+    mutating func reveal(_ fraction: Double) {
+        guard fraction.isFinite else { return }
+        let time = min(1, max(0, fraction))
+        let position = (time - start) * scale
+        // Leave room in the direction of travel without constantly recentering.
+        if position < 0.15 {
+            start = min(maximumStart, max(0, time - 0.25 / scale))
+        } else if position > 0.85 {
+            start = min(maximumStart, max(0, time - 0.75 / scale))
+        }
+    }
 }
 
 @MainActor
@@ -92,7 +104,9 @@ final class EditorWindow: NSWindow, NSWindowDelegate {
                                             anchor: Double((point.x - 24 - axis.minX) / axis.width))
                 } else {
                     let delta = event.scrollingDeltaX != 0 ? event.scrollingDeltaX : event.scrollingDeltaY
-                    editorModel.panTimeAxis(by: -Double(delta) / Double(axis.width) / editorModel.timeViewport.scale)
+                    let sensitivity = event.modifierFlags.contains(.shift)
+                        ? (event.hasPreciseScrollingDeltas ? 2.0 : 24.0) : 1.0
+                    editorModel.panTimeAxis(by: -Double(delta) * sensitivity / Double(axis.width) / editorModel.timeViewport.scale)
                 }
                 return
             }
@@ -742,7 +756,7 @@ private struct EditorTimeScroller: NSViewRepresentable {
     @ObservedObject var model: EditorModel
     func makeCoordinator() -> Coordinator { Coordinator(model: model) }
     func makeNSView(context: Context) -> NSScroller {
-        let view = NSScroller(frame: NSRect(x: 0, y: 0, width: 100, height: 12))
+        let view = EditorTimeScrollerView(frame: NSRect(x: 0, y: 0, width: 100, height: 12))
         view.scrollerStyle = .legacy
         view.knobStyle = .light
         view.controlSize = .small
@@ -759,6 +773,7 @@ private struct EditorTimeScroller: NSViewRepresentable {
         view.doubleValue = value.maximumStart > 0 ? value.start / value.maximumStart : 0
         view.isEnabled = value.scale > 1
         view.alphaValue = value.scale > 1 ? 1 : 0
+        view.needsDisplay = true
     }
     @MainActor final class Coordinator: NSObject {
         let model: EditorModel
@@ -771,6 +786,30 @@ private struct EditorTimeScroller: NSViewRepresentable {
                 model.panTimeAxis(by: sender.doubleValue * model.timeViewport.maximumStart - model.timeViewport.start)
             }
         }
+    }
+}
+
+/// Keep AppKit's drag target while drawing a slim track and thumb.
+final class EditorTimeScrollerView: NSScroller {
+    var visibleKnobRect: NSRect {
+        let knob = rect(for: .knob)
+        return NSRect(x: knob.minX, y: bounds.midY - 2, width: knob.width, height: 4)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        drawKnobSlot(in: rect(for: .knobSlot), highlight: false)
+        drawKnob()
+    }
+
+    override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
+        NSColor(AppTheme.line).setFill()
+        let track = NSRect(x: slotRect.minX, y: bounds.midY - 1, width: slotRect.width, height: 2)
+        NSBezierPath(roundedRect: track, xRadius: 1, yRadius: 1).fill()
+    }
+
+    override func drawKnob() {
+        NSColor(AppTheme.secondary).withAlphaComponent(0.7).setFill()
+        NSBezierPath(roundedRect: visibleKnobRect, xRadius: 2, yRadius: 2).fill()
     }
 }
 
@@ -1005,8 +1044,8 @@ private struct ProductionTimeline: View {
         DragGesture(minimumDistance: 0, coordinateSpace: .named("productionTimeline")).onChanged { value in
             model.isPlaying = false
             model.player.pause()
-            model.seek(axis.time(at: value.location.x, total: total))
-        }
+            model.seek(axis.time(at: value.location.x, total: total), followViewport: false)
+        }.onEnded { _ in model.revealTimeAxisPlayhead() }
     }
 
     private func clipLayouts(axis: EditorTimeAxisGeometry, total: Double) -> [TimelineClipLayout] {

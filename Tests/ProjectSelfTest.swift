@@ -274,6 +274,23 @@ enum ProjectSelfTest {
         }
         for _ in 0..<100 { viewport.zoom(by: 0.8, anchor: 0.2); viewport.pan(by: -100) }
         try check(viewport.scale == 1 && viewport.start == 0, "时间轴能缩到100%以下或无法恢复完整范围")
+        viewport.zoom(by: 4, anchor: 0)
+        viewport.reveal(0.7)
+        try check(abs(viewport.start - 0.5125) < 1e-12,
+                  "向右跳转没有保留前方余量")
+        let settled = viewport
+        viewport.reveal(0.71)
+        try check(viewport == settled, "可视范围内的小幅移动触发了不必要的重新聚焦")
+        viewport.reveal(0.4)
+        try check(abs(viewport.start - 0.3375) < 1e-12, "向左跳转没有保留前方余量")
+        for target in [0.0, 1, -1, 2] {
+            viewport.reveal(target)
+            try check(viewport.start >= 0 && viewport.start <= viewport.maximumStart,
+                      "自动跟随露出素材范围以外的空白")
+        }
+        let finiteViewport = viewport
+        viewport.reveal(.nan)
+        try check(viewport == finiteViewport, "无效跳转损坏了可视范围")
         let model = EditorModel()
         model.clips = [DemoClip(title: "视图缩放", sourceStart: 0, duration: 120, zooms: [.standard(duration: 120)])]
         model.seek(30)
@@ -286,9 +303,23 @@ enum ProjectSelfTest {
         model.beginEditing()
         model.zoomTimeAxis(by: 2, anchor: 0.5)
         model.panTimeAxis(by: 0.2)
+        model.seek(100)
         model.endEditing()
         try check(model.timeViewport == before, "节点编辑中缩放视图改变了正在拖动的坐标系")
-        print("PASS shared timeline viewport: 100%-6400% bounds, cursor anchoring, shared time/pixel mapping, scaled drag deltas, bounded panning, exact full-fit reset and no content/playhead/Undo mutations")
+        model.seek(100)
+        try check(abs((100 / 120.0 - model.timeViewport.start) * model.timeViewport.scale - 0.75) < 1e-10,
+                  "跳转没有带回播放头和动画轴的共同可见范围")
+        model.panTimeAxis(by: -10)
+        model.seek(100, followViewport: false)
+        try check(model.timeViewport.start == 0, "拖动播放头时可视范围提前移动，改变了鼠标坐标")
+        model.revealTimeAxisPlayhead()
+        try check(model.timeViewport.start > 0, "拖动结束后没有恢复目标可见性")
+        model.panTimeAxis(by: -10)
+        model.isPlaying = true
+        try check(model.timeViewport.start > 0, "开始播放没有恢复播放头可见性")
+        model.isPlaying = false
+        try check(model.clips == clips && !model.canUndo, "自动跟随修改了工程或撤销历史")
+        print("PASS shared timeline viewport: bounded 100%-6400% zoom/pan, anchored mapping, edge-margin reveal without jitter, stable drag coordinates, playback resume and no content/Undo mutations")
     }
 
     private static func checkLocalFramingCorrection() throws {
