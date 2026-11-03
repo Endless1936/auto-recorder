@@ -1972,9 +1972,9 @@ enum EditorUISelfTest {
         }
 
         func ensureActiveAndKeyWindow() async throws {
-            let activationAccepted = NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
-            NSApp.activate(ignoringOtherApps: true)
-            window.makeKeyAndOrderFront(nil)
+            let activationAccepted = NSApp.isActive || NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            if !window.isKeyWindow { window.makeKeyAndOrderFront(nil) }
             await nextRunLoopTurn()
             let deadline = Date().addingTimeInterval(1)
             while (!NSApp.isActive || !window.isKeyWindow), Date() < deadline { await settle(0.02) }
@@ -2006,12 +2006,24 @@ enum EditorUISelfTest {
         }
 
         func refreshDisplayedLayout() async {
-            window.contentView?.layoutSubtreeIfNeeded()
-            window.contentView?.displayIfNeeded()
-            await nextRunLoopTurn()
-            window.contentView?.layoutSubtreeIfNeeded()
-            window.contentView?.displayIfNeeded()
-            events.append(["action": "layout-after-undo", "clipOrder": model.clips.map { $0.id.uuidString }.joined(separator: ",")])
+            var previous: NSSize?
+            var stable = 0
+            // WindowServer and NSHostingView can commit a resize on different
+            // run-loop turns. Never locate input in an intermediate content size.
+            for _ in 0..<40 {
+                window.contentView?.layoutSubtreeIfNeeded()
+                window.contentView?.displayIfNeeded()
+                let size = window.contentView?.bounds.size ?? .zero
+                let expected = window.contentRect(forFrameRect: window.frame).size
+                let matches = abs(size.width - expected.width) < 0.5 && abs(size.height - expected.height) < 0.5
+                stable = matches && previous == size ? stable + 1 : 0
+                if stable >= 2 { break }
+                previous = size
+                await settle(0.02)
+            }
+            events.append(["action": "layout-after-undo", "clipOrder": model.clips.map { $0.id.uuidString }.joined(separator: ","),
+                           "windowFrame": NSStringFromRect(window.frame),
+                           "contentBounds": NSStringFromRect(window.contentView?.bounds ?? .zero)])
         }
 
         func click(_ identifier: String, delay: Double = 0.16) async throws {

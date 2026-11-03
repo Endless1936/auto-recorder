@@ -139,11 +139,13 @@ struct ZoomSegment: Identifiable, Codable, Equatable, Sendable {
     }
 
     var preferredFramingSampleTimes: [Double] {
-        let times = centerPath.map(\.time) + (manualCenterPath ?? []).map(\.time) +
-            cameraControlPoints.map(\.time) + (centerOffsets ?? []).map(\.time) +
-            (centerPanSpans ?? []).flatMap { [$0.start, $0.end] } +
-            (localCenterEdits ?? []).flatMap { [$0.start, $0.time, $0.end] }
-        return Array(Set(times.filter(\.isFinite))).sorted()
+        var times: [Double] = centerPath.map(\.time)
+        times.append(contentsOf: (manualCenterPath ?? []).map(\.time))
+        times.append(contentsOf: cameraControlPoints.map(\.time))
+        times.append(contentsOf: (centerOffsets ?? []).map(\.time))
+        for span in centerPanSpans ?? [] { times.append(contentsOf: [span.start, span.end]) }
+        for edit in localCenterEdits ?? [] { times.append(contentsOf: [edit.start, edit.time, edit.end]) }
+        return Array(Set(times.filter { $0.isFinite })).sorted()
     }
 
     private func sortedMotionTimes(_ times: [Double]) -> [Double] {
