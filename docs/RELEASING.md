@@ -6,7 +6,7 @@
 
 本项目当前按 **已签名、未公证** 的方式发布，首次打开由用户在 macOS 中允许该应用运行。公证不作为本次发布前置条件，普通用户无需配置开发者账号或钥匙串。
 
-1. 更新 `Info.plist` 的版本号和构建号，运行相关回归。
+1. 更新 `Info.plist` 的版本号和构建号、README 中的手动下载版本链接，运行相关回归。
 2. 保持现有 bundle identifier 和 Developer ID 签名身份，避免让老用户重新识别为另一个应用。
 3. 用 Developer ID、Hardened Runtime、麦克风 entitlement 和安全时间戳构建：
 

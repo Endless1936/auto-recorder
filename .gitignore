@@ -15,6 +15,7 @@ xcuserdata/
 /Tests/release-*.json
 /Tests/validation.json
 *.log
+*.textClipping
 *.dmg
 *.zip
 *.tar.gz
@@ -42,4 +43,5 @@ project.before-*.json
 *.keychain
 *.keychain-db
 *.mobileprovision
-AuthKey_*.p8
+*.provisionprofile
+*.p8
