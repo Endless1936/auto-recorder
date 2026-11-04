@@ -51,14 +51,17 @@ enum AutoZoomSelfTest {
         for fps in [30, 60] {
             let pause = AutoZoomPlan(trace: CursorTrace(samples: [
                 CursorSample(time: 0.5, x: 0.3, y: 0.5, inside: true, clicked: true)
-            ]), duration: 3, fps: fps)
-            try check(pause.pose(at: 1.4).scale > 1.59 && pause.pose(at: 1.75).scale < 1.15 &&
-                      pause.pose(at: 2.5).scale < 1.001, "应在停顿 1 秒后开始平滑恢复全景")
+            ]), duration: 3.5, fps: fps)
+            try check(pause.pose(at: 2).scale > 1.59 && pause.pose(at: 2.25).scale < 1.15 &&
+                      pause.pose(at: 3).scale < 1.001, "应在停顿 1.5 秒后开始平滑恢复全景")
+            guard let onset = pause.returns.first else { throw RecorderError.message("静止后没有回全景过渡") }
+            try check(abs(onset.time - 2) <= 1 / Double(fps) + 0.000001,
+                      "回全景起点不是最后一次有效活动后 1.5 秒")
             let slow = AutoZoomPlan(trace: CursorTrace(samples: slowSamples), duration: 8.5, fps: fps)
             try check(slow.pose(at: 4).scale > 1.59, "慢速持续移动被误判为空闲")
             try check(slow.pose(at: 8.2).scale < 1.001, "慢速移动停止后未恢复全景")
             let jitter = AutoZoomPlan(trace: CursorTrace(samples: jitterSamples), duration: 5, fps: fps)
-            try check(jitter.pose(at: 2.5).scale < 1.001, "微小往返抖动意外延长放大")
+            try check(jitter.pose(at: 3).scale < 1.001, "微小往返抖动意外延长放大")
             let reentry = AutoZoomPlan(trace: CursorTrace(samples: [
                 CursorSample(time: 0, x: 0.3, y: 0.5, inside: true, clicked: true),
                 CursorSample(time: 1, x: 1.1, y: 0.5, inside: false, clicked: false),
@@ -75,7 +78,7 @@ enum AutoZoomSelfTest {
         let saved = try JSONEncoder().encode(trace)
         try check(try JSONDecoder().decode(CursorTrace.self, from: saved).samples.count == trace.samples.count,
                   "轨迹保存错误")
-        print("PASS zoom plan: offset coordinates, host time alignment, clicks, 1-second idle/outside restore, bounded crop, no-click, slow movement, jitter, reentry, 30/60fps, JSON")
+        print("PASS zoom plan: offset coordinates, host time alignment, clicks, exact 1.5-second idle delay, immediate outside restore, bounded crop, no-click, slow movement, jitter, reentry, 30/60fps, JSON")
         print("PASS 50% safe zone: interior and exact-edge hold, smooth threshold crossing, both axes/directions, in-zone clicks, bounded crop and unchanged idle timing at 30/60fps")
     }
 
@@ -329,8 +332,8 @@ enum AutoZoomSelfTest {
                               "基础运镜先平移居中，未从当前取景框直接展开")
                 }
                 let zoom = ProjectStore.automaticZooms(trace: trace, duration: 4, fps: Int32(fps))[0]
-                let stopped = ProjectStore.automaticZooms(trace: trace, duration: 1.65, fps: Int32(fps))[0]
-                try check(stopped.fallStart < 1.55 && stopped.scale(at: 1.6) < stopped.peak - 0.01,
+                let stopped = ProjectStore.automaticZooms(trace: trace, duration: 2.15, fps: Int32(fps))[0]
+                try check(stopped.fallStart < 2.05 && stopped.scale(at: 2.1) < stopped.peak - 0.01,
                           "片尾截在回全景过程中时，缩放被错误推迟到录制结束后")
                 let start = zoom.pose(at: transition.time)
                 let initialLeft = start.x - 0.5 / start.scale, initialTop = start.y - 0.5 / start.scale
@@ -399,9 +402,9 @@ enum AutoZoomSelfTest {
                 let firstDistance = (firstCoordinate - 0.5) * direction
                 try check(firstDistance > 0 && firstDistance < panDistance,
                           "\(label)：越界后应平滑移动，不能立即跳到新中心")
-                try check(plan.pose(at: 2.9).scale > 1.59 && plan.pose(at: 3.35).scale < 1.08 &&
-                          plan.pose(at: 4.2).scale < 1.001,
-                          "\(label)：放大持续时间应仍为最后一次活动后1秒，再平滑回全景")
+                try check(plan.pose(at: 3.4).scale > 1.59 && plan.pose(at: 3.85).scale < 1.08 &&
+                          plan.pose(at: 4.45).scale < 1.001,
+                          "\(label)：最后一次活动后等待1.5秒，再平滑回全景")
                 try checkBounded(plan, label: label)
 
                 let clicked = AutoZoomPlan(trace: CursorTrace(samples: [

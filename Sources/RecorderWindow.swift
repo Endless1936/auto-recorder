@@ -23,7 +23,7 @@ final class RecorderWindow: NSWindow {
         set { super.maxSize = fixedFrameSize ?? newValue }
     }
     init(settings: RecorderSettings, onMode: @escaping (CaptureMode) -> Void, onSource: @escaping () -> Void,
-         onRefresh: @escaping () -> Void,
+         onRefresh: @escaping () async -> Void,
          onAudio: @escaping () -> Void, onStart: @escaping () -> Void, onOpen: @escaping () -> Void,
          onDirectory: @escaping () -> Void, onRegion: @escaping () -> Void, onPermissions: @escaping () -> Void) {
         self.settings = settings
@@ -74,7 +74,7 @@ private struct RecorderPanel: View {
     @ObservedObject var settings: RecorderSettings
     let onMode: (CaptureMode) -> Void
     let onSource: () -> Void
-    let onRefresh: () -> Void
+    let onRefresh: () async -> Void
     let onAudio: () -> Void
     let onStart: () -> Void
     let onOpen: () -> Void
@@ -107,12 +107,12 @@ private struct RecorderPanel: View {
             }.frame(height: 104).padding(.bottom, 18).disabled(locked)
             HStack(spacing: 12) {
                 Text("录制来源").frame(width: 72, alignment: .leading)
-                if settings.loadingSources { ProgressView().controlSize(.small); Spacer() }
-                else {
-                    SourcePopUpField(items: settings.sources, selection: settings.sourceID, onRefresh: onRefresh) { id in
+                    SourcePopUpField(items: settings.sources, selection: settings.sourceID, onOpen: {
+                        await onRefresh()
+                        return (settings.sources, settings.sourceID)
+                    }) { id in
                         settings.sourceID = id; onSource()
                     }.frame(maxWidth: .infinity).frame(height: 34)
-                }
             }.frame(height: 36).padding(.bottom, 8).disabled(locked)
             HStack(spacing: 12) {
                 Text("保存位置").frame(width: 72, alignment: .leading)

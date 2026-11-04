@@ -50,7 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window = RecorderWindow(settings: settings,
             onMode: { [weak self] in self?.changeMode($0) },
             onSource: { [weak self] in self?.sourceChanged() },
-            onRefresh: { [weak self] in self?.refreshSources() },
+            onRefresh: { [weak self] in await self?.refreshSources() },
             onAudio: { [weak self] in self?.audioChanged() },
             onStart: { [weak self] in self?.toggleRecording() },
             onOpen: { [weak self] in self?.openProject() },
@@ -63,6 +63,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         refreshDisplays()
         refreshMicrophones()
         recorder.onChange = { [weak self] in self?.updateState() }
+        recorder.onPrepareWindow = { [weak self] in
+            self?.window.orderOut(nil); self?.editorWindow?.orderOut(nil)
+        }
         recorder.onLevels = { [weak self] system, mic in
             self?.applyLevels(system: system, microphone: mic)
         }
@@ -232,7 +235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !settings.microphones.contains(where: { $0.id == settings.microphoneID }) { settings.microphoneID = "" }
     }
     private func refreshDisplays() {
-        guard settings.mode != .window else { refreshWindows(); return }
+        guard settings.mode != .window else { Task { await refreshWindows(selectFirst: true) }; return }
         settings.sources = NSScreen.screens.compactMap { screen in
             guard let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value else { return nil }
             return CaptureSourceItem(id: id, name: screen.localizedName)
@@ -240,15 +243,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !settings.sources.contains(where: { $0.id == settings.sourceID }) { settings.sourceID = settings.sources.first?.id ?? 0 }
         settings.loadingSources = false
     }
-    private func refreshWindows() {
+    private func refreshWindows(selectFirst: Bool = false) async {
+        guard recorder.state == .idle, !settings.busy, !selecting, settings.mode == .window else { return }
         sourceGeneration += 1
         let generation = sourceGeneration
         settings.loadingSources = true
-        Task {
             do {
                 if !CGPreflightScreenCaptureAccess(), !CGRequestScreenCaptureAccess() { throw RecorderError.screenAuthorization }
                 let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
-                guard sourceGeneration == generation, settings.mode == .window else { return }
+                guard sourceGeneration == generation, settings.mode == .window,
+                      recorder.state == .idle, !settings.busy else { return }
                 windowSources = content.windows.filter {
                     $0.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier &&
                     $0.frame.width > 80 && $0.frame.height > 60 && $0.windowLayer == 0
@@ -258,26 +262,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                     let name = ($0.title?.isEmpty == false) ? "\(application) · \($0.title!)" : application
                     return CaptureSourceItem(id: $0.windowID, name: name)
                 }
-                if !settings.sources.contains(where: { $0.id == settings.sourceID }) { settings.sourceID = settings.sources.first?.id ?? 0 }
-                settings.error = settings.sources.isEmpty ? "没有可用窗口，请先打开要录制的应用。" : ""
+                if !settings.sources.contains(where: { $0.id == settings.sourceID }) {
+                    settings.sourceID = selectFirst ? settings.sources.first?.id ?? 0 : 0
+                }
+                settings.error = settings.sources.isEmpty ? "没有可用窗口，请先打开要录制的应用。" :
+                    settings.sourceID == 0 ? "请选择要录制的窗口。" : ""
             } catch {
-                if sourceGeneration == generation { settings.error = "请先在系统设置中允许录屏，再刷新窗口列表。" }
+                if sourceGeneration == generation { settings.error = "请允许录屏后重新打开窗口列表。" }
             }
             if sourceGeneration == generation { settings.loadingSources = false }
-        }
     }
 
     private func changeMode(_ mode: CaptureMode) {
-        guard recorder.state == .idle, !selecting else { return }
+        guard recorder.state == .idle, !settings.busy, !selecting else { return }
         guard settings.mode != mode else { return }
         sourceGeneration += 1
         settings.mode = mode; settings.sourceID = 0; selectedRegion = nil; settings.regionTitle = "选择区域"
         settings.error = ""; refreshDisplays()
     }
-    private func refreshSources() {
+    private func refreshSources() async {
         guard recorder.state == .idle, !selecting else { return }
         let previousID = settings.sourceID
-        refreshDisplays()
+        if settings.mode == .window { await refreshWindows() }
+        else { refreshDisplays() }
         if settings.mode != .window, settings.sourceID != previousID {
             selectedRegion = nil; settings.regionTitle = "选择区域"
         }
@@ -355,6 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if settings.mode == .region, selectedRegion == nil { chooseRegion(startAfter: true); return }
         if settings.sourceID == 0 { settings.error = "请先选择录制来源。"; return }
         settings.save(); settings.error = ""; settings.busy = true
+        sourceGeneration += 1
         Task {
             do {
                 monitorGeneration += 1; await levels.stop()
@@ -531,6 +539,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         let automated = CommandLine.arguments.contains("--integration-test") || CommandLine.arguments.contains("--render-previews") || CommandLine.arguments.contains("--editor-ui-test")
         if recorder.state == .idle, !automated { restartLevels() }
+    }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard window?.isVisible == true, recorder.state == .idle, !selecting,
+              integrationDirectory == nil, !CommandLine.arguments.contains("--editor-ui-test"),
+              !CommandLine.arguments.contains("--render-previews") else { return }
+        refreshMicrophones()
+        Task { await refreshSources() }
     }
     @objc private func openPermissions() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)

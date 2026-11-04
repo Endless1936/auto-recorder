@@ -18,6 +18,7 @@ final class Recorder {
     var onFinished: ((URL, RecordingStats, Error?) -> Void)?
     var onError: ((Error) -> Void)?
     var onLevels: ((Double, Double) -> Void)?
+    var onPrepareWindow: (() -> Void)?
     private(set) var lastTrace: CursorTrace?
     private(set) var actualDuration: Double = 0
     private(set) var lastCaptureDiagnosticSummary = ""
@@ -66,9 +67,10 @@ final class Recorder {
             if !CGPreflightScreenCaptureAccess(), !CGRequestScreenCaptureAccess() {
                 throw RecorderError.screenAuthorization
             }
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
-                throw RecorderError.message("所选屏幕已断开，请刷新屏幕列表。")
+            var content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            if let windowID {
+                onPrepareWindow?()
+                content = try await Self.prepareWindow(windowID, content: content)
             }
             // Application rules also cover guide windows created after capture starts.
             let ownApplications = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
@@ -84,6 +86,9 @@ final class Recorder {
                 selectedWindow = window
                 filter = SCContentFilter(desktopIndependentWindow: window)
             } else {
+                guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+                    throw RecorderError.message("所选屏幕已断开，请重新选择录制来源。")
+                }
                 guard !ownApplications.isEmpty else {
                     throw RecorderError.message("无法识别本程序的录制窗口，请重新打开Auto Recorder后重试。")
                 }
@@ -164,13 +169,6 @@ final class Recorder {
             startedAt = Date()
             if let windowID { monitorWindow(windowID) }
             onChange?()
-            // Some applications stop publishing window frames while inactive.
-            // Bring the selected application forward after hiding our controls.
-            if let owner = selectedWindow?.owningApplication,
-               let application = NSRunningApplication(processIdentifier: owner.processID) {
-                NSApp.yieldActivation(to: application)
-                application.activate(options: [])
-            }
         } catch {
             regionOverlay.hide()
             windowMonitor?.invalidate(); windowMonitor = nil
@@ -247,6 +245,58 @@ final class Recorder {
     }
 
     func skipAutoZoom() { }
+
+    /// Resolve the same window again after activation; collapsed Stage Manager
+    /// content must not determine the encoder size or the first recorded frames.
+    private static func prepareWindow(_ id: CGWindowID, content: SCShareableContent) async throws -> SCShareableContent {
+        guard let original = content.windows.first(where: { $0.windowID == id }),
+              let owner = original.owningApplication,
+              owner.processID != ProcessInfo.processInfo.processIdentifier,
+              let application = NSRunningApplication(processIdentifier: owner.processID) else {
+            throw RecorderError.message("所选窗口已关闭或不可用，请重新选择。")
+        }
+        application.unhide()
+        NSApp.yieldActivation(to: application)
+        guard application.activate(options: []) else {
+            throw RecorderError.message("无法调出所选窗口，请先将它切到前台再录制。")
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        var stableSince = ProcessInfo.processInfo.systemUptime
+        var previousFrame: CGRect?
+        var previousSize: CGSize?
+        var previousScale: Float?
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            try Task.checkCancellation()
+            let fresh = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard !application.isTerminated, let window = fresh.windows.first(where: { $0.windowID == id }) else {
+                throw RecorderError.message("所选窗口已关闭，请重新选择。")
+            }
+            let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == owner.processID
+            let frontWindow = frontWindowID(for: owner.processID)
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let size = filter.contentRect.size
+            if frontmost, frontWindow == id, window.isOnScreen, size.width > 0, size.height > 0 {
+                if previousFrame == window.frame, previousSize == size, previousScale == filter.pointPixelScale {
+                    if ProcessInfo.processInfo.systemUptime - stableSince >= 0.35 { return fresh }
+                } else { stableSince = ProcessInfo.processInfo.systemUptime }
+                previousFrame = window.frame; previousSize = size; previousScale = filter.pointPixelScale
+            } else {
+                previousFrame = nil; previousSize = nil; previousScale = nil
+                stableSince = ProcessInfo.processInfo.systemUptime
+            }
+            try await Task.sleep(nanoseconds: 80_000_000)
+        }
+        throw RecorderError.message("请先将选定窗口切到前台并展开，再开始录制。")
+    }
+
+    private static func frontWindowID(for processID: pid_t) -> CGWindowID? {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
+        return windows.first(where: {
+            ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == processID &&
+                ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0 &&
+                (($0[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 0) > 0.01
+        }).flatMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value }
+    }
 
     private static func windowInfo(_ id: CGWindowID) -> (bounds: CGRect, onScreen: Bool)? {
         guard let items = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]],

@@ -9,6 +9,7 @@ private struct WindowFixtureInfo: Codable {
 
 private struct WindowFixtureCommand: Codable {
     var id: UUID
+    var minimize = false
 }
 
 private struct WindowFixtureReply: Codable {
@@ -80,9 +81,12 @@ final class WindowCaptureFixture {
               let command = try? JSONDecoder().decode(WindowFixtureCommand.self, from: data),
               command.id != lastCommand else { return }
         lastCommand = command.id
-        window.deminiaturize(nil)
-        window.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        if command.minimize { window.miniaturize(nil) }
+        else {
+            window.deminiaturize(nil)
+            window.makeKeyAndOrderFront(nil)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
         window.displayIfNeeded()
         let reply = WindowFixtureReply(id: command.id, visible: window.isVisible,
                                        minimized: window.isMiniaturized, tick: tick)
@@ -196,9 +200,26 @@ enum WindowCaptureSelfTest {
                 receivedOutput = url
                 if let error { captureErrors.append(String(describing: error)) }
             }
+            let cover = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 700, height: 460),
+                                 styleMask: [.titled], backing: .buffered, defer: false)
+            cover.isReleasedWhenClosed = false
+            cover.title = "Auto Recorder · Window Activation Test"
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            cover.makeKeyAndOrderFront(nil)
+            try await Task.sleep(nanoseconds: 150_000_000)
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier else {
+                cover.close()
+                throw RecorderError.message("窗口前置测试未能先激活测试录制面板。")
+            }
             await recorder.start(displayID: display.displayID, url: output, fps: 30, quality: .hevc,
                 audioOptions: .init(systemAudio: systemAudio, microphone: false),
                 autoZoom: false, windowID: info.windowID)
+            if recorder.state == .recording,
+               NSWorkspace.shared.frontmostApplication?.processIdentifier != info.processID {
+                captureErrors.append("开始录制前未将目标应用带到前台。")
+            }
+            cover.orderOut(nil); cover.close()
             if recorder.state == .recording { try await Task.sleep(nanoseconds: 2_000_000_000) }
             await recorder.stop()
             var result = Result(configuration: variant, dimensions: recorder.pixelSize,
@@ -212,6 +233,33 @@ enum WindowCaptureSelfTest {
             results.append(result)
             print("WINDOW \(variant): \(result.captureSummary); decoded=\(result.decodedFrames); duration=\(result.duration); errors=\(result.errors)")
         }
+        // A minimized target must either be restored successfully or fail before
+        // creating any media. Never accept a recording of its collapsed surface.
+        _ = try await prepareFixture(info, directory: fixtureDirectory)
+        let minimize = WindowFixtureCommand(id: UUID(), minimize: true)
+        try JSONEncoder().encode(minimize).write(to: fixtureDirectory.appendingPathComponent("command.json"), options: .atomic)
+        for _ in 0..<50 {
+            if let data = try? Data(contentsOf: fixtureDirectory.appendingPathComponent("reply.json")),
+               let reply = try? JSONDecoder().decode(WindowFixtureReply.self, from: data),
+               reply.id == minimize.id, reply.minimized { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let guarded = Recorder()
+        let guardedURL = directory.appendingPathComponent("minimized-guard.mov")
+        var guardErrors: [Error] = []
+        guarded.onError = { guardErrors.append($0) }
+        await guarded.start(displayID: CGMainDisplayID(), url: guardedURL, fps: 30, quality: .hevc,
+                            audioOptions: .init(systemAudio: false, microphone: false), windowID: info.windowID)
+        if guarded.state == .recording {
+            try await Task.sleep(nanoseconds: 1_200_000_000)
+            await guarded.stop()
+            guard try await decodeFrames(url: guardedURL) > 5 else { throw RecorderError.message("恢复后的窗口没有有效视频。") }
+        } else {
+            guard guarded.state == .idle, !guardErrors.isEmpty, !FileManager.default.fileExists(atPath: guardedURL.path) else {
+                throw RecorderError.message("未能展开的窗口仍生成了录制文件。")
+            }
+        }
+        print("PASS window preparation: inactive target activated before capture; minimized target restored or refused before media creation")
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(results).write(to: directory.appendingPathComponent("window-capture-results.json"), options: .atomic)
         guard results.allSatisfy({ $0.errors.isEmpty && $0.decodedFrames > 5 && $0.duration > 1 }) else {

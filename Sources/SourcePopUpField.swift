@@ -4,12 +4,15 @@ import SwiftUI
 struct SourcePopUpField: View {
     let items: [CaptureSourceItem]
     let selection: UInt32
-    var onRefresh: (() -> Void)? = nil
+    var onOpen: (() async -> ([CaptureSourceItem], UInt32))? = nil
     let onSelect: (UInt32) -> Void
 
     var body: some View {
         NativePopUpField(items: items.map { PopUpItem(id: $0.id, name: $0.name) },
-                         selection: selection, placeholder: "选择来源", onRefresh: onRefresh, onSelect: onSelect)
+                         selection: selection, placeholder: "选择来源", onOpen: onOpen.map { action in
+                             { let (items, selection) = await action()
+                                 return (items.map { PopUpItem(id: $0.id, name: $0.name) }, selection) }
+                         }, onSelect: onSelect)
     }
 }
 
@@ -20,7 +23,7 @@ struct MicrophonePopUpField: View {
 
     var body: some View {
         NativePopUpField(items: items.map { PopUpItem(id: $0.id, name: $0.name) },
-                         selection: selection, placeholder: "系统默认", onRefresh: nil, onSelect: onSelect)
+                         selection: selection, placeholder: "系统默认", onOpen: nil, onSelect: onSelect)
     }
 }
 
@@ -33,7 +36,7 @@ private struct NativePopUpField<ID: Hashable>: NSViewRepresentable {
     let items: [PopUpItem<ID>]
     let selection: ID
     let placeholder: String
-    let onRefresh: (() -> Void)?
+    let onOpen: (() async -> ([PopUpItem<ID>], ID))?
     let onSelect: (ID) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(onSelect: onSelect) }
@@ -49,27 +52,37 @@ private struct NativePopUpField<ID: Hashable>: NSViewRepresentable {
         let coordinator = context.coordinator
         view.button.isEnabled = context.environment.isEnabled
         coordinator.onSelect = onSelect
-        coordinator.onRefresh = onRefresh
-        coordinator.selection = selection
-        if coordinator.items != items || coordinator.hasRefresh != (onRefresh != nil) || view.button.numberOfItems == 0 {
-            coordinator.items = items
-            coordinator.hasRefresh = onRefresh != nil
-            view.setItems(items.map(\.name), placeholder: placeholder, hasRefresh: onRefresh != nil)
+        coordinator.apply(items: items, selection: selection, to: view, placeholder: placeholder)
+        view.button.prepareMenu = onOpen.map { action in
+            { [weak view, weak coordinator] in
+                let (items, selection) = await action()
+                guard let view, let coordinator else { return }
+                coordinator.apply(items: items, selection: selection, to: view, placeholder: placeholder)
+            }
         }
-        coordinator.restoreSelection(view.button)
     }
 
     final class Coordinator: NSObject {
         var items: [PopUpItem<ID>] = []
         var selection: ID?
-        var hasRefresh = false
-        var onRefresh: (() -> Void)?
+        var hasPlaceholder = false
         var onSelect: (ID) -> Void
 
         init(onSelect: @escaping (ID) -> Void) { self.onSelect = onSelect }
 
+        func apply(items: [PopUpItem<ID>], selection: ID, to view: PopUpContainer, placeholder: String) {
+            let showPlaceholder = !items.contains { $0.id == selection }
+            if self.items != items || hasPlaceholder != showPlaceholder || view.button.numberOfItems == 0 {
+                self.items = items
+                hasPlaceholder = showPlaceholder
+                view.setItems(items.map(\.name), placeholder: placeholder, showsPlaceholder: showPlaceholder)
+            }
+            self.selection = selection
+            restoreSelection(view.button)
+        }
+
         func restoreSelection(_ button: NSPopUpButton) {
-            let index = items.firstIndex { $0.id == selection } ?? 0
+            let index = items.firstIndex { $0.id == selection }.map { $0 + (hasPlaceholder ? 1 : 0) } ?? 0
             button.selectItem(at: index)
             button.toolTip = button.selectedItem?.toolTip
         }
@@ -82,14 +95,53 @@ private struct NativePopUpField<ID: Hashable>: NSViewRepresentable {
                 onSelect(item.id)
             } else {
                 restoreSelection(button)
-                onRefresh?()
             }
         }
     }
 }
 
+/// Refresh before entering AppKit's synchronous menu-tracking loop.
+final class PreparedSourcePopUpButton: NSPopUpButton {
+    var prepareMenu: (() async -> Void)?
+    private var preparing = false
+
+    func prepareForOpening() async -> Bool {
+        guard !preparing, isEnabled else { return false }
+        preparing = true
+        defer { preparing = false }
+        await prepareMenu?()
+        return isEnabled && window?.isVisible == true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard prepareMenu != nil else { super.mouseDown(with: event); return }
+        Task { @MainActor [weak self] in
+            guard let self, await self.prepareForOpening() else { return }
+            self.openPreparedMenu(with: event)
+        }
+    }
+
+    override func performClick(_ sender: Any?) {
+        guard prepareMenu != nil else { super.performClick(sender); return }
+        Task { @MainActor [weak self] in
+            guard let self, await self.prepareForOpening() else { return }
+            self.openPreparedMenu(with: nil)
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if prepareMenu != nil, [UInt16(36), 49, 125, 126].contains(event.keyCode) { performClick(nil) }
+        else { super.keyDown(with: event) }
+    }
+
+    private func openPreparedMenu(with event: NSEvent?) {
+        if let event { super.mouseDown(with: event) }
+        else { super.performClick(nil) }
+    }
+}
+
 private final class PopUpContainer: NSView, NSMenuDelegate {
-    let button = NSPopUpButton(frame: .zero, pullsDown: false)
+    let button = PreparedSourcePopUpButton(frame: .zero, pullsDown: false)
     private var titles: [(item: NSMenuItem, title: String)] = []
     private let menuFont = NSFont.systemFont(ofSize: 14)
 
@@ -116,19 +168,16 @@ private final class PopUpContainer: NSView, NSMenuDelegate {
 
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 34) }
 
-    func setItems(_ names: [String], placeholder: String, hasRefresh: Bool) {
+    func setItems(_ names: [String], placeholder: String, showsPlaceholder: Bool) {
+        button.menu?.cancelTrackingWithoutAnimation()
         button.removeAllItems()
         titles = []
-        if names.isEmpty {
+        if showsPlaceholder {
             let item = addItem(placeholder)
             item.isEnabled = false
         }
         for (index, name) in names.enumerated() {
             addItem(name).representedObject = index
-        }
-        if hasRefresh {
-            button.menu?.addItem(.separator())
-            addItem("刷新来源")
         }
         updateTitles()
     }

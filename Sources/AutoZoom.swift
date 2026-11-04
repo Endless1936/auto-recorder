@@ -122,6 +122,7 @@ struct ZoomReturn: Sendable {
 
 /// A precomputed path makes random-access export requests deterministic.
 struct AutoZoomPlan: Sendable {
+    static let idleReturnDelay = 1.5
     let fps: Int
     let poses: [ZoomPose]
     let returns: [ZoomReturn]
@@ -165,7 +166,7 @@ struct AutoZoomPlan: Sendable {
                 pointer = next
                 index += 1
             }
-            if time - lastActivity > 1 { active = false }
+            if time - lastActivity > Self.idleReturnDelay { active = false }
             let scale = active ? 1.6 : 1.0
             if active, let pointer {
                 let margin = 0.5 / scale

@@ -53,6 +53,7 @@ if let index = CommandLine.arguments.firstIndex(of: "--audio-monitor-test"), Com
         do {
             try SelectionInteractionSelfTest.run()
             try await SelectionInteractionSelfTest.checkUnchangedDisplayNotification()
+            try await SourceMenuSelfTest.run()
             exit(0)
         }
         catch { fputs("SELECTION TEST FAILED: \(error)\n", stderr); exit(1) }
