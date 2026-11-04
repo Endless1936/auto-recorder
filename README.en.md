@@ -23,7 +23,7 @@ removing quarantine or installing developer tools. Report the version and
 installation path. If you cannot operate this Mac, say so honestly.
 ```
 
-[Manual download v2.4.1](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.1/Auto-Recorder-v2.4.1-macos-arm64.dmg) · [中文](README.md)
+[Manual download v2.4.2](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.2/Auto-Recorder-v2.4.2-macos-arm64.dmg) · [中文](README.md)
 
 🍎 Apple Silicon, macOS 15+, Chinese UI.
 
