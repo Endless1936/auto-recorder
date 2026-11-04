@@ -5,8 +5,8 @@
     <key>CFBundleDisplayName</key><string>Auto Recorder</string>
     <key>CFBundleExecutable</key><string>AutoRecorder</string>
     <key>CFBundleIdentifier</key><string>local.prototech.screenrecorder</string>
-    <key>CFBundleVersion</key><string>25</string>
-    <key>CFBundleShortVersionString</key><string>2.4.0</string>
+    <key>CFBundleVersion</key><string>26</string>
+    <key>CFBundleShortVersionString</key><string>2.4.1</string>
     <key>CFBundleIconFile</key><string>AppIcon.icns</string>
     <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Auto Recorder contributors.</string>
     <key>CFBundlePackageType</key><string>APPL</string>

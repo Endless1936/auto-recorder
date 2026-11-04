@@ -1,4 +1,12 @@
+<img src="Assets/AppIcon.png" alt="Auto Recorder 图标" width="88" align="right">
+
 # Auto Recorder
+
+🎬 本地录屏，自动放大，轻松剪切。
+
+🖥️ 录制屏幕、窗口或选区　·　🎯 跟随鼠标聚焦　·　✂️ 剪切并导出
+
+### 🚀 安装
 
 复制这段给 **Codex 或能操作本机的 Agent**：
 
@@ -16,10 +24,10 @@ https://github.com/Endless1936/auto-recorder/releases/latest
 完成后告知版本和路径；没有操作本机的能力时请如实说明。
 ```
 
-[手动下载 v2.4.0](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.0/Auto-Recorder-v2.4.0-macos-arm64.dmg) · [English](README.en.md)
+[手动下载 v2.4.1](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.1/Auto-Recorder-v2.4.1-macos-arm64.dmg) · [English](README.en.md)
 
-Mac 本地录屏，支持自动放大和简单剪切。适用 M1 及更新芯片、macOS 15+，界面为中文。
+🍎 适用 M1 及更新芯片、macOS 15+，界面为中文。
 
 手动安装：将 App 拖入“应用程序”。若首次被拦截，到“系统设置 → 隐私与安全性 → 仍要打开”，再按提示授权录屏。
 
-[使用说明](docs/USAGE.md) · [开发与贡献](CONTRIBUTING.md) · [GPL-3.0-only](LICENSE)
+📖 [使用说明](docs/USAGE.md) · [开发与贡献](CONTRIBUTING.md) · [GPL-3.0-only](LICENSE)

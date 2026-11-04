@@ -1,4 +1,12 @@
+<img src="Assets/AppIcon.png" alt="Auto Recorder icon" width="88" align="right">
+
 # Auto Recorder
+
+🎬 Local screen recording, automatic zoom, and simple cuts.
+
+🖥️ Record a screen, window, or area　·　🎯 Follow your cursor　·　✂️ Cut and export
+
+### 🚀 Install
 
 Copy this to **Codex or an agent that can operate your Mac**:
 
@@ -17,10 +25,10 @@ removing quarantine or installing developer tools. Report the version and
 installation path. If you cannot operate this Mac, say so honestly.
 ```
 
-[Manual download v2.4.0](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.0/Auto-Recorder-v2.4.0-macos-arm64.dmg) · [中文](README.md)
+[Manual download v2.4.1](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.1/Auto-Recorder-v2.4.1-macos-arm64.dmg) · [中文](README.md)
 
-Local Mac screen recording with automatic zoom and simple cuts. Apple Silicon, macOS 15+, Chinese UI.
+🍎 Apple Silicon, macOS 15+, Chinese UI.
 
 Manual install: drag the app into Applications. If first launch is blocked, use System Settings → Privacy & Security → Open Anyway, then grant recording access.
 
-[Usage (Chinese)](docs/USAGE.md) · [Contributing](CONTRIBUTING.md) · [GPL-3.0-only](LICENSE)
+📖 [Usage (Chinese)](docs/USAGE.md) · [Contributing](CONTRIBUTING.md) · [GPL-3.0-only](LICENSE)

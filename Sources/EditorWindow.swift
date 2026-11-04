@@ -147,15 +147,6 @@ final class EditorWindow: NSWindow, NSWindowDelegate {
     }
 
     private func returnToRecorder() {
-        editorModel.isPlaying = false
-        editorModel.player.pause()
-        do { try editorModel.autosave() }
-        catch {
-            let alert = NSAlert(error: error)
-            alert.beginSheetModal(for: self)
-            return
-        }
-        orderOut(nil)
         backAction()
     }
 }

@@ -361,12 +361,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
               editor?.isExporting != true, exportPanel == nil else { return }
         if settings.mode == .region, selectedRegion == nil { chooseRegion(startAfter: true); return }
         if settings.sourceID == 0 { settings.error = "请先选择录制来源。"; return }
+        guard prepareToLeaveEditor() else { return }
         settings.save(); settings.error = ""; settings.busy = true
         sourceGeneration += 1
         Task {
             do {
                 monitorGeneration += 1; await levels.stop()
-                if let editor { try editor.autosave(); editor.isPlaying = false }
                 let directory = try ProjectStore.createFolder(in: settings.directory)
                 activeFolder = directory
                 let raw = directory.appendingPathComponent(directory.lastPathComponent + ".mov")
@@ -471,8 +471,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard recorder.state == .idle, !openingProject, editor?.isExporting != true else { return }
         openingProject = true
         defer { openingProject = false }
+        guard prepareToLeaveEditor() else { return }
         do {
-            if let editor { try editor.autosave(); editor.isPlaying = false }
             let model = EditorModel()
             model.onError = { [weak self] error in self?.showError(error) }
             try await model.loadProject(folder: folder)
@@ -491,8 +491,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         } catch { showError(error) }
     }
     private func returnToRecorder() {
-        do { try editor?.autosave() } catch { showError(error); return }
+        guard prepareToLeaveEditor() else { return }
         editor?.isPlaying = false; editorWindow?.orderOut(nil); showWindow()
+    }
+    private func prepareToLeaveEditor() -> Bool {
+        guard let editor else { return true }
+        editor.isPlaying = false
+        do {
+            try editor.autosave()
+            return true
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "工程无法保存"
+            alert.informativeText = "\(error.localizedDescription)\n请恢复工程文件夹后重试，或放弃未保存的修改。"
+            alert.addButton(withTitle: "取消")
+            alert.addButton(withTitle: "放弃修改并继续")
+            guard alert.runModal() == .alertSecondButtonReturn else { return false }
+            editor.onError = nil
+            editorWindow?.delegate = nil
+            editorWindow?.close()
+            editorWindow = nil
+            self.editor = nil
+            return true
+        }
     }
     @objc private func exportVideo() {
         guard let editor, !editor.isExporting else { return }
@@ -599,7 +620,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             editor?.cancelExport()
             return .terminateCancel
         }
-        do { try editor?.autosave() } catch { showError(error); return .terminateCancel }
+        guard prepareToLeaveEditor() else { return .terminateCancel }
         return .terminateNow
     }
     func applicationWillTerminate(_ notification: Notification) {
