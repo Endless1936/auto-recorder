@@ -1,6 +1,4 @@
-<img src="Assets/AppIcon.png" alt="Auto Recorder icon" width="88">
-
-# Auto Recorder
+<h1 align="center"><img src="Assets/AppIcon.png" alt="Auto Recorder icon" width="48" align="absmiddle"> Auto Recorder</h1>
 
 🎬 Local screen recording, automatic zoom, and simple cuts.
 

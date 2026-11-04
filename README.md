@@ -1,6 +1,4 @@
-<img src="Assets/AppIcon.png" alt="Auto Recorder 图标" width="88">
-
-# Auto Recorder
+<h1 align="center"><img src="Assets/AppIcon.png" alt="Auto Recorder 图标" width="48" align="absmiddle"> Auto Recorder</h1>
 
 🎬 本地录屏，自动放大，轻松剪切。
 
