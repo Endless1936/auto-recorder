@@ -1,4 +1,4 @@
-<img src="Assets/AppIcon.png" alt="Auto Recorder icon" width="88" align="right">
+<img src="Assets/AppIcon.png" alt="Auto Recorder icon" width="88">
 
 # Auto Recorder
 
