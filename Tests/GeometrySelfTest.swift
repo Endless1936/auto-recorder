@@ -24,6 +24,26 @@ enum GeometrySelfTest {
             catch { rejected = true }
             try check(rejected, "拒绝屏幕外与过小的区域")
         }
+        let domain = "region-test-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: domain) else { throw RecorderError.message("无法创建选区测试设置") }
+        defer { defaults.removePersistentDomain(forName: domain) }
+        try check(RegionMemory.load(from: defaults) == nil, "没有保存记录时应使用默认选区")
+        let remembered = RememberedRegion(displayID: 123, displaySize: size, scale: 2,
+                                          rect: CGRect(x: 100, y: 60, width: 400, height: 200))
+        RegionMemory.save(remembered, to: defaults)
+        let restored = RegionMemory.load(from: defaults)
+        try check(restored?.restored(displayID: 123, displaySize: size, scale: 2) == remembered.rect,
+                  "保存后应能恢复原选区")
+        try check(restored?.restored(displayID: 124, displaySize: size, scale: 2) == nil &&
+                  restored?.restored(displayID: 123, displaySize: CGSize(width: 1000, height: 800), scale: 2) == nil &&
+                  restored?.restored(displayID: 123, displaySize: size, scale: 1) == nil,
+                  "显示器或分辨率变化时不应恢复旧选区")
+        let outside = RememberedRegion(displayID: 123, displaySize: size, scale: 2,
+                                       rect: CGRect(x: 1800, y: 900, width: 400, height: 200))
+        try check(outside.restored(displayID: 123, displaySize: size, scale: 2) == nil,
+                  "屏幕外的旧选区不能被恢复")
+        defaults.set(Data("invalid".utf8), forKey: "lastCaptureRegion")
+        try check(RegionMemory.load(from: defaults) == nil, "损坏的记录应回退到默认选区")
         let drawn = SelectionGeometry.draw(from: CGPoint(x: 800, y: 500), to: CGPoint(x: 100, y: 120), size: size)
         try check(drawn == CGRect(x: 100, y: 120, width: 700, height: 380), "反向拖拽")
         let moved = SelectionGeometry.move(drawn, delta: CGPoint(x: -9999, y: 9999), size: size)
@@ -36,6 +56,6 @@ enum GeometrySelfTest {
         try check(SelectionGeometry.hitEdges(CGPoint(x: 88, y: 250), rect: drawn) == .left, "整条边 12 点命中")
         try check(SelectionGeometry.hitEdges(CGPoint(x: 87, y: 250), rect: drawn) == nil, "边界命中区外可重画")
         try check(SelectionGeometry.hitEdges(CGPoint(x: 300, y: 300), rect: drawn) == nil, "内部可自由移动")
-        print("PASS region geometry: Retina, pixel alignment, crop bounds, reverse drag, move, resize, invalid regions")
+        print("PASS region geometry: Retina, pixel alignment, crop bounds, reverse drag, move, resize, invalid regions, persistent region and display validation")
     }
 }

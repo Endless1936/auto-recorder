@@ -111,6 +111,7 @@ private struct RecorderPanel: View {
                         await onRefresh()
                         return (settings.sources, settings.sourceID)
                     }) { id in
+                        guard settings.sourceID != id else { return }
                         settings.sourceID = id; onSource()
                     }.frame(maxWidth: .infinity).frame(height: 34)
             }.frame(height: 36).padding(.bottom, 8).disabled(locked)
@@ -211,7 +212,10 @@ private struct RecorderPanel: View {
         let selected = settings.mode == mode
         let regionAction = selected && mode == .region
         return Button {
-            if regionAction { onRegion() } else { onMode(mode) }
+            if mode == .region {
+                if !selected { onMode(mode) }
+                onRegion()
+            } else { onMode(mode) }
         } label: {
             VStack(spacing: 8) {
                 Image(systemName: symbol).font(.system(size: 29, weight: .light)).frame(height: 34)

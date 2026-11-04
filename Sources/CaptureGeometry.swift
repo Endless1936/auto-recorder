@@ -8,6 +8,34 @@ struct CaptureArea {
     let pixelHeight: Int
 }
 
+struct RememberedRegion: Codable {
+    let displayID: UInt32
+    let displaySize: CGSize
+    let scale: CGFloat
+    let rect: CGRect
+
+    func restored(displayID: UInt32, displaySize: CGSize, scale: CGFloat) -> CGRect? {
+        guard self.displayID == displayID, self.displaySize == displaySize, self.scale == scale,
+              rect.width >= SelectionGeometry.minimum, rect.height >= SelectionGeometry.minimum,
+              [rect.minX, rect.minY, rect.width, rect.height].allSatisfy(\.isFinite),
+              CGRect(origin: .zero, size: displaySize).contains(rect),
+              let area = try? CaptureGeometry.area(region: rect, displaySize: displaySize, scale: scale) else { return nil }
+        return area.sourceRect
+    }
+}
+
+enum RegionMemory {
+    private static let key = "lastCaptureRegion"
+    static func load(from defaults: UserDefaults = .standard) -> RememberedRegion? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(RememberedRegion.self, from: data)
+    }
+    static func save(_ region: RememberedRegion, to defaults: UserDefaults = .standard) {
+        guard let data = try? JSONEncoder().encode(region) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
 enum CaptureGeometry {
     /// Rectangles are display-local points, with the origin at the top left.
     static func area(region: CGRect?, displaySize: CGSize, scale: CGFloat) throws -> CaptureArea {

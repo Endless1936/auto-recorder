@@ -83,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 self.lastLayout = layout; self.selector.cancel(); self.selectedRegion = nil
                 if self.recorder.state == .recording || self.recorder.state == .paused || self.recorder.state == .starting {
                     await self.recorder.stop(captureError: RecorderError.message("显示器布局已改变，录制已停止并保存。"))
-                } else { self.refreshDisplays() }
+                } else { self.refreshDisplays(); self.restoreSelectedRegion() }
             }
         }
         shortcuts = GlobalShortcuts(onRecord: { [weak self] in self?.toggleRecording() },
@@ -279,6 +279,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         sourceGeneration += 1
         settings.mode = mode; settings.sourceID = 0; selectedRegion = nil; settings.regionTitle = "选择区域"
         settings.error = ""; refreshDisplays()
+        if mode == .region {
+            if let remembered = RegionMemory.load(), settings.sources.contains(where: { $0.id == remembered.displayID }) {
+                settings.sourceID = remembered.displayID
+            }
+            restoreSelectedRegion()
+        }
     }
     private func refreshSources() async {
         guard recorder.state == .idle, !selecting else { return }
@@ -286,12 +292,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if settings.mode == .window { await refreshWindows() }
         else { refreshDisplays() }
         if settings.mode != .window, settings.sourceID != previousID {
-            selectedRegion = nil; settings.regionTitle = "选择区域"
+            restoreSelectedRegion()
         }
     }
     private func sourceChanged() {
         guard recorder.state == .idle else { return }
-        selectedRegion = nil; settings.regionTitle = "选择区域"; refreshDisplays()
+        refreshDisplays(); restoreSelectedRegion()
     }
     private var displayID: CGDirectDisplayID {
         settings.mode == .window ? CGMainDisplayID() : settings.sourceID
@@ -299,8 +305,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var selectedScreen: NSScreen? {
         NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == displayID }
     }
-    private func chooseRegion(startAfter: Bool = false) {
+    private func restoreSelectedRegion() {
+        selectedRegion = nil
+        if settings.mode == .region, let screen = selectedScreen {
+            selectedRegion = RegionMemory.load()?.restored(displayID: displayID,
+                displaySize: screen.frame.size, scale: screen.backingScaleFactor)
+        }
+        settings.regionTitle = selectedRegion.map { "\(Int($0.width)) × \(Int($0.height))" } ?? "选择区域"
+    }
+    private func chooseRegion() {
         guard recorder.state == .idle, !selecting, let screen = selectedScreen else { return }
+        if selectedRegion == nil { restoreSelectedRegion() }
         selecting = true; window.orderOut(nil)
         selector.begin(screen: screen, initial: selectedRegion) { [weak self] area in
             guard let self else { return }
@@ -308,9 +323,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if let area {
                 self.selectedRegion = area
                 self.settings.regionTitle = "\(Int(area.width)) × \(Int(area.height))"
+                self.settings.error = ""
+                RegionMemory.save(RememberedRegion(displayID: self.displayID, displaySize: screen.frame.size,
+                    scale: screen.backingScaleFactor, rect: area))
             }
             self.showWindow()
-            if startAfter, area != nil { self.toggleRecording() }
         }
     }
 
@@ -359,7 +376,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if recorder.state == .recording || recorder.state == .paused { stopRecording(); return }
         guard recorder.state == .idle, !selecting, !settings.busy, !openingProject,
               editor?.isExporting != true, exportPanel == nil else { return }
-        if settings.mode == .region, selectedRegion == nil { chooseRegion(startAfter: true); return }
+        if settings.mode == .region, selectedRegion == nil {
+            settings.error = "请先点击“选定区域”并确认录制范围。"
+            return
+        }
         if settings.sourceID == 0 { settings.error = "请先选择录制来源。"; return }
         guard prepareToLeaveEditor() else { return }
         settings.save(); settings.error = ""; settings.busy = true
