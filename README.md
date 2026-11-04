@@ -22,7 +22,7 @@ https://github.com/Endless1936/auto-recorder/releases/latest
 完成后告知版本和路径；没有操作本机的能力时请如实说明。
 ```
 
-[手动下载 v2.4.2](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.2/Auto-Recorder-v2.4.2-macos-arm64.dmg) · [English](README.en.md)
+[手动下载 v2.4.3](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.3/Auto-Recorder-v2.4.3-macos-arm64.dmg) · [English](README.en.md)
 
 🍎 适用 M1 及更新芯片、macOS 15+，界面为中文。
 
