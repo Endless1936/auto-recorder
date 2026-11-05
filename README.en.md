@@ -1,10 +1,6 @@
 <h1 align="center"><img src="Assets/AppIcon.png" alt="Auto Recorder icon" width="48" align="absmiddle"> Auto Recorder</h1>
 
-🎬 Local screen recording, automatic zoom, and simple cuts.
-
-🖥️ Record a screen, window, or area　·　🎯 Follow your cursor　·　✂️ Cut and export
-
-### 🚀 Install
+## 🤖 Install with an agent
 
 Copy this to **Codex or an agent that can operate your Mac**:
 
@@ -23,10 +19,29 @@ removing quarantine or installing developer tools. Report the version and
 installation path. If you cannot operate this Mac, say so honestly.
 ```
 
-[Manual download v2.4.3](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.3/Auto-Recorder-v2.4.3-macos-arm64.dmg) · [中文](README.md)
+## 🎬 Made for demonstrations
 
-🍎 Apple Silicon, macOS 15+, Chinese UI.
+Auto Recorder is a local Mac screen recorder for AI tool demos, software tutorials, and product walkthroughs. It automatically zooms in as you work, then lets you make simple cuts and adjust the framing.
 
-Manual install: drag the app into Applications. If first launch is blocked, use System Settings → Privacy & Security → Open Anyway, then grant recording access.
+## ✨ Highlights
 
-📖 [Usage (Chinese)](docs/USAGE.md) · [Contributing](CONTRIBUTING.md) · [GPL-3.0-only](LICENSE)
+- 🖥️ **Flexible capture** — Record a screen, a window, or a selected area. Your last confirmed area is remembered.
+- 🎯 **Automatic focus** — Zoom in on a click, follow the cursor, and smoothly return to full view after inactivity.
+- ✂️ **Simple editing** — Split, trim, delete, and rearrange clips on the timeline. Adjust the zoom curve and framing.
+- 🎙️ **Audio control** — Independently toggle system audio and microphone input. Pause and resume from the menu bar.
+- 📁 **Editable projects** — Keep the original recording and project in a local folder, reopen it to edit, and export when ready.
+- 🎞️ **Quality options** — Record in HEVC or ProRes 422 at 30 or 60 fps.
+
+## 🚀 Get started
+
+1. Choose a screen, window, or area and your audio sources, then start recording.
+2. Stop when finished and adjust clips or framing in the editor.
+3. Export your video or keep the project for later.
+
+## 🍎 Manual installation
+
+Requires Apple Silicon (M1 or later) and macOS 15 or later. The app interface is in Chinese.
+
+Download [Auto Recorder 2.4.3](https://github.com/Endless1936/auto-recorder/releases/download/v2.4.3/Auto-Recorder-v2.4.3-macos-arm64.dmg), open the DMG, and drag the app into Applications. If first launch is blocked, use System Settings → Privacy & Security → Open Anyway, then grant screen-recording access.
+
+📖 [Usage (Chinese)](docs/USAGE.md) · [Contributing](CONTRIBUTING.md) · [GPL-3.0-only](LICENSE) · [中文](README.md)
